@@ -1,0 +1,1481 @@
+"""
+模块描述：WorkAid 本地法律法规检索引擎，负责从 rag/data 构建索引并提供精确、模糊和关联检索。
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+import sqlite3
+import threading
+import time
+from contextlib import closing, contextmanager
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-Unix fallback
+    fcntl = None
+
+BASE_DIR = Path(__file__).resolve().parent
+RAW_DATA_DIR = BASE_DIR / "data"
+CACHE_DIR = BASE_DIR / "cache"
+DB_PATH = CACHE_DIR / "law.db"
+MANIFEST_PATH = CACHE_DIR / "manifest.json"
+SCHEMA_VERSION = 5
+MAX_TITLE_CHARS = 160
+MAX_ARTICLE_NUMBER_CHARS = 40
+MAX_QUERY_CHARS = 4000
+MAX_SEARCH_LIMIT = 20
+MAX_QUERY_TERMS = 32
+MIN_PARTIAL_TITLE_CHARS = 2
+
+CN_NUM = {
+    "零": 0,
+    "〇": 0,
+    "一": 1,
+    "二": 2,
+    "两": 2,
+    "三": 3,
+    "四": 4,
+    "五": 5,
+    "六": 6,
+    "七": 7,
+    "八": 8,
+    "九": 9,
+}
+CN_UNIT = {"十": 10, "百": 100, "千": 1000, "万": 10000}
+ARTICLE_TOKEN = r"[一二三四五六七八九十百千万零〇两0-9]+"
+ARTICLE_NUMBER_RE = re.compile(
+    rf"第(?P<main>{ARTICLE_TOKEN})条(?:之(?P<sub>{ARTICLE_TOKEN}))?"
+)
+ARTICLE_HEADER_RE = re.compile(
+    rf"(?m)^[ \t\u3000]*(?P<number>第{ARTICLE_TOKEN}条(?:之{ARTICLE_TOKEN})?)[ \t\u3000]*"
+)
+QUOTED_CITATION_RE = re.compile(
+    rf"《(?P<title>[^》\n]{{2,80}})》(?P<number>第{ARTICLE_TOKEN}条(?:之{ARTICLE_TOKEN})?)"
+)
+TITLE_SUFFIX_RE = re.compile(r"\s*(English)?(已被修改|废止或失效)?\s*$")
+FILE_TITLE_PAREN_RE = re.compile(r"[（(][^)）]+[)）]\s*$")
+SKIP_EFFECTIVENESS_KEYWORDS = ("废止", "失效", "已被修改")
+QUERY_SYNONYMS = {
+    "醉驾": ["醉酒驾驶", "危险驾驶罪"],
+    "酒驾": ["饮酒驾驶", "醉酒驾驶"],
+    "危险驾驶罪": ["危险驾驶", "危险驾驶罪"],
+    "违约金": ["违约责任", "违约金"],
+    "工伤": ["工伤保险", "工伤认定"],
+}
+
+BUILD_LOCK = threading.Lock()
+
+
+@dataclass
+class Article:
+    law_name: str
+    article_number: str
+    content: str
+    category: str = ""
+    url: str = ""
+    cli: str = ""
+    publish_date: str = ""
+    implement_date: str = ""
+    effectiveness: str = ""
+
+
+@dataclass
+class SourceLaw:
+    law_name: str
+    short_name: str
+    metadata: Dict[str, str]
+    articles: List[Tuple[str, str]]
+    category: str
+
+
+class LawSearchEngine:
+    """基于 SQLite 的本地法律检索引擎。"""
+
+    def __init__(self) -> None:
+        if not RAW_DATA_DIR.exists():
+            raise ValueError(f"法律语料目录不存在: {RAW_DATA_DIR}")
+        self._df_cache: Dict[str, int] = {}
+        self._article_total = 0
+        self._ensure_built()
+
+    def fetch_articles(self, pairs: Sequence[Tuple[str, str]]) -> str:
+        """按 (法律全名, 条号) 取条文全文，供向量召回把命中还原成完整条文。"""
+        start_time = time.time()
+        data: List[Dict[str, str]] = []
+        with closing(self._connect()) as conn:
+            for law_name, article_number in list(pairs)[:100]:
+                row = conn.execute(
+                    """
+                    SELECT laws.law_name, laws.category, laws.url, laws.cli,
+                           laws.publish_date, laws.implement_date, laws.effectiveness,
+                           articles.article_number, articles.content
+                    FROM laws
+                    JOIN articles ON articles.law_id = laws.id
+                    WHERE laws.law_name = ? AND articles.article_number = ?
+                    LIMIT 1
+                    """,
+                    (law_name, article_number),
+                ).fetchone()
+                if row:
+                    data.append({key: row[key] for key in row.keys()})
+        return json.dumps(
+            {"success": bool(data), "data": data, "search_time": time.time() - start_time},
+            ensure_ascii=False,
+        )
+
+    def iter_articles(self, categories: Sequence[str] = ()) -> List[Dict[str, str]]:
+        """全部条文（可按语料类别过滤），供离线构建向量索引。"""
+        sql = """
+            SELECT laws.law_name, laws.category, laws.effectiveness, laws.publish_date,
+                   articles.article_number, articles.content
+            FROM articles JOIN laws ON laws.id = articles.law_id
+        """
+        params: List[str] = []
+        if categories:
+            sql += f" WHERE laws.category IN ({','.join('?' for _ in categories)})"
+            params = list(categories)
+        with closing(self._connect()) as conn:
+            return [{key: row[key] for key in row.keys()} for row in conn.execute(sql, params)]
+
+    def article_count(self) -> int:
+        if not self._article_total:
+            with closing(self._connect()) as conn:
+                self._article_total = conn.execute("SELECT COUNT(*) FROM articles").fetchone()[0]
+        return self._article_total
+
+    def term_doc_freq(self, term: str) -> int:
+        """含该词的条文数，结果按词缓存；供检索重排计算 IDF。"""
+        compact = trim_text(term, MAX_TITLE_CHARS).replace(" ", "")
+        if len(compact) < _LIKE_MIN_TERM_CHARS:
+            return self.article_count()
+        if compact in self._df_cache:
+            return self._df_cache[compact]
+        with closing(self._connect()) as conn:
+            try:
+                if len(compact) >= _FTS_MIN_TERM_CHARS and fts_index_available(conn):
+                    count = conn.execute(
+                        f"SELECT COUNT(*) FROM {_FTS_TABLE_NAME} WHERE {_FTS_TABLE_NAME} MATCH ?",
+                        (_fts_match_expr([compact]),),
+                    ).fetchone()[0]
+                else:
+                    count = conn.execute(
+                        "SELECT COUNT(*) FROM articles WHERE search_blob_compact LIKE ? ESCAPE '\\'",
+                        (_like_patterns_for([compact])[0],),
+                    ).fetchone()[0]
+            except sqlite3.OperationalError:
+                count = self.article_count()
+        self._df_cache[compact] = count
+        return count
+
+    def exact_search(self, law_name: str, article_number: str) -> str:
+        start_time = time.time()
+        result = {
+            "success": False,
+            "message": "",
+            "data": None,
+            "search_time": 0.0,
+        }
+
+        law_name = trim_text(law_name, MAX_TITLE_CHARS)
+        article_number = trim_text(article_number, MAX_ARTICLE_NUMBER_CHARS)
+        if not law_name or not article_number:
+            result["message"] = "法律名称和条号不能为空"
+            result["search_time"] = time.time() - start_time
+            return json.dumps(result, ensure_ascii=False)
+
+        law = self._find_law_by_name(law_name)
+        if not law:
+            result["message"] = f"未找到法律: {law_name}"
+            result["search_time"] = time.time() - start_time
+            return json.dumps(result, ensure_ascii=False)
+
+        normalized_article = normalize_article_number(article_number)
+        if not normalized_article:
+            result["message"] = f"无法识别法条号: {article_number}"
+            result["search_time"] = time.time() - start_time
+            return json.dumps(result, ensure_ascii=False)
+
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                """
+                SELECT laws.law_name, laws.category, laws.url, laws.cli,
+                       laws.publish_date, laws.implement_date, laws.effectiveness,
+                       articles.article_number, articles.content
+                FROM articles
+                JOIN laws ON laws.id = articles.law_id
+                WHERE laws.id = ? AND articles.normalized_article = ?
+                LIMIT 1
+                """,
+                (law["id"], normalized_article),
+            ).fetchone()
+
+        if not row:
+            result["message"] = f"未找到法条: {law['law_name']} {article_number}"
+            result["search_time"] = time.time() - start_time
+            return json.dumps(result, ensure_ascii=False)
+
+        result["success"] = True
+        result["message"] = "找到匹配的法条"
+        result["data"] = asdict(
+            Article(
+                law_name=row["law_name"],
+                article_number=row["article_number"],
+                content=row["content"],
+                category=row["category"],
+                url=row["url"],
+                cli=row["cli"],
+                publish_date=row["publish_date"],
+                implement_date=row["implement_date"],
+                effectiveness=row["effectiveness"],
+            )
+        )
+        result["search_time"] = time.time() - start_time
+        return json.dumps(result, ensure_ascii=False)
+
+    def fuzzy_search(self, keyword: str, limit: int = 5) -> str:
+        start_time = time.time()
+        safe_limit = normalize_limit(limit)
+        result = {
+            "success": False,
+            "message": "",
+            "data": [],
+            "total_count": 0,
+            "returned_count": 0,
+            "search_time": 0.0,
+        }
+
+        query = normalize_query(trim_text(keyword, MAX_QUERY_CHARS))
+        if not query:
+            result["message"] = "检索关键词不能为空"
+            result["search_time"] = time.time() - start_time
+            return json.dumps(result, ensure_ascii=False)
+
+        terms = build_query_terms(query)
+        candidates: List[Tuple[int, Dict[str, str]]] = []
+
+        # 预过滤下推到 SQLite，避免每次查询把全表 content/search_blob 拉进 Python：
+        # - 优先 FTS5 trigram（search_blob_compact 去空格列，>=3 字符的词）；
+        # - 短词或 FTS 不可用/查询失败时回退 REPLACE+LIKE。
+        # 两条路径与 Python 侧 `compact_term in compact_blob` 语义等价
+        # （大小写不敏感只会多选，多出的行由 score_article 精确打分剔除）。
+        compact_terms = _compact_query_terms(query, terms)
+        fts_terms = [term for term in compact_terms if len(term) >= _FTS_MIN_TERM_CHARS]
+        like_terms = [term for term in compact_terms if len(term) < _FTS_MIN_TERM_CHARS]
+
+        base_sql = """
+            SELECT laws.law_name, laws.category, laws.url, laws.cli,
+                   laws.publish_date, laws.implement_date, laws.effectiveness,
+                   articles.article_number, articles.content, articles.search_blob
+            FROM articles
+            JOIN laws ON laws.id = articles.law_id
+        """
+
+        def execute_scan(where_clause: str, params: Sequence[Any]):
+            sql = base_sql + (f" WHERE {where_clause}" if where_clause else "")
+            with closing(self._connect()) as conn:
+                return conn.execute(sql, params).fetchall()
+
+        rows: List[sqlite3.Row] = []
+        if compact_terms:
+            if fts_terms:
+                fts_clause = (
+                    f"articles.id IN (SELECT rowid FROM {_FTS_TABLE_NAME} "
+                    "WHERE articles_fts MATCH ?)"
+                )
+                fts_params = [_fts_match_expr(fts_terms)]
+                params: List[Any] = list(fts_params)
+                if like_terms:
+                    like_clause = " OR ".join(
+                        "REPLACE(articles.search_blob, ' ', '') LIKE ? ESCAPE '\\'"
+                        for _ in _like_patterns_for(like_terms)
+                    )
+                    like_params = _like_patterns_for(like_terms)
+                    where_clause = f"({fts_clause} OR {like_clause})"
+                    params.extend(like_params)
+                else:
+                    where_clause = fts_clause
+                try:
+                    rows = execute_scan(where_clause, params)
+                except sqlite3.OperationalError:
+                    # MATCH 语法异常（畸形词等）时整体降级为 LIKE 扫描。
+                    rows = execute_scan(*build_like_prefilter(query, terms))
+            else:
+                rows = execute_scan(*build_like_prefilter(query, terms))
+        else:
+            rows = execute_scan("", [])
+
+        for row in rows:
+            score = score_article(row, query, terms)
+            if score <= 0:
+                continue
+
+            candidates.append(
+                (
+                    score,
+                    {
+                        "law_name": row["law_name"],
+                        "article_number": row["article_number"],
+                        "content": row["content"],
+                        "category": row["category"],
+                        "url": row["url"],
+                        "cli": row["cli"],
+                        "publish_date": row["publish_date"],
+                        "implement_date": row["implement_date"],
+                        "effectiveness": row["effectiveness"],
+                    },
+                )
+            )
+
+        candidates.sort(
+            key=lambda item: (
+                -item[0],
+                len(item[1]["law_name"]),
+                len(item[1]["content"]),
+            )
+        )
+        selected = [item[1] for item in candidates[:safe_limit]]
+
+        result["success"] = bool(selected)
+        result["message"] = "找到相关法条" if selected else "未检索到相关法条,请调整输入的描述"
+        result["data"] = selected
+        result["total_count"] = len(candidates)
+        result["returned_count"] = len(selected)
+        result["search_time"] = time.time() - start_time
+        return json.dumps(result, ensure_ascii=False)
+
+    def bm25_search(self, phrases: Sequence[str], limit: int = 20) -> str:
+        """FTS5 BM25 召回：phrases 之间为 OR 关系，仅 >=3 字的短语可走 trigram 索引。"""
+        start_time = time.time()
+        result = {
+            "success": False,
+            "message": "",
+            "data": [],
+            "returned_count": 0,
+            "search_time": 0.0,
+        }
+        terms = [
+            term
+            for term in dict.fromkeys(
+                trim_text(phrase, MAX_TITLE_CHARS).replace(" ", "") for phrase in phrases
+            )
+            if len(term) >= _FTS_MIN_TERM_CHARS
+        ][: MAX_QUERY_TERMS]
+        if not terms:
+            result["message"] = "没有可用于全文索引的检索短语"
+            result["search_time"] = time.time() - start_time
+            return json.dumps(result, ensure_ascii=False)
+
+        try:
+            with closing(self._connect()) as conn:
+                rows = conn.execute(
+                    f"""
+                    SELECT laws.law_name, laws.category, laws.url, laws.cli,
+                           laws.publish_date, laws.implement_date, laws.effectiveness,
+                           articles.article_number, articles.content,
+                           bm25({_FTS_TABLE_NAME}) AS rank_score
+                    FROM {_FTS_TABLE_NAME}
+                    JOIN articles ON articles.id = {_FTS_TABLE_NAME}.rowid
+                    JOIN laws ON laws.id = articles.law_id
+                    WHERE {_FTS_TABLE_NAME} MATCH ?
+                    ORDER BY rank_score
+                    LIMIT ?
+                    """,
+                    (_fts_match_expr(terms), normalize_limit(limit)),
+                ).fetchall()
+        except sqlite3.OperationalError:
+            rows = []
+
+        result["data"] = [
+            {
+                "law_name": row["law_name"],
+                "article_number": row["article_number"],
+                "content": row["content"],
+                "category": row["category"],
+                "url": row["url"],
+                "cli": row["cli"],
+                "publish_date": row["publish_date"],
+                "implement_date": row["implement_date"],
+                "effectiveness": row["effectiveness"],
+                "bm25": row["rank_score"],
+            }
+            for row in rows
+        ]
+        result["success"] = bool(rows)
+        result["message"] = "找到相关法条" if rows else "未检索到相关法条"
+        result["returned_count"] = len(rows)
+        result["search_time"] = time.time() - start_time
+        return json.dumps(result, ensure_ascii=False)
+
+    def link_search(self, message: str, limit: int = 5) -> str:
+        start_time = time.time()
+        message = trim_text(message, MAX_QUERY_CHARS)
+        safe_limit = normalize_limit(limit)
+        references: List[Dict[str, str]] = []
+        seen = set()
+
+        for title, number in extract_quoted_citations(message):
+            exact = json.loads(self.exact_search(title, number))
+            if not exact.get("success"):
+                continue
+            data = exact.get("data") or {}
+            key = (data.get("law_name", ""), data.get("article_number", ""))
+            if key in seen:
+                continue
+            seen.add(key)
+            references.append(
+                {
+                    "title": data.get("law_name", ""),
+                    "article_number": data.get("article_number", ""),
+                    "url": data.get("url", ""),
+                    "content": data.get("content", ""),
+                }
+            )
+
+        for title, number in self._extract_unquoted_citations(message, safe_limit):
+            exact = json.loads(self.exact_search(title, number))
+            if not exact.get("success"):
+                continue
+            data = exact.get("data") or {}
+            key = (data.get("law_name", ""), data.get("article_number", ""))
+            if key in seen:
+                continue
+            seen.add(key)
+            references.append(
+                {
+                    "title": data.get("law_name", ""),
+                    "article_number": data.get("article_number", ""),
+                    "url": data.get("url", ""),
+                    "content": data.get("content", ""),
+                }
+            )
+
+        if not references:
+            for law_name, url in self._find_law_mentions(message, safe_limit):
+                key = (law_name, "")
+                if key in seen:
+                    continue
+                seen.add(key)
+                references.append(
+                    {
+                        "title": law_name,
+                        "article_number": "",
+                        "url": url,
+                        "content": "",
+                    }
+                )
+
+        if not references:
+            fuzzy = json.loads(self.fuzzy_search(message, safe_limit))
+            for item in fuzzy.get("data") or []:
+                key = (item.get("law_name", ""), item.get("article_number", ""))
+                if key in seen:
+                    continue
+                seen.add(key)
+                references.append(
+                    {
+                        "title": item.get("law_name", ""),
+                        "article_number": item.get("article_number", ""),
+                        "url": item.get("url", ""),
+                        "content": item.get("content", ""),
+                    }
+                )
+
+        text = format_references(references)
+        payload = {
+            "success": bool(references),
+            "message": "找到相关法规信源" if references else "未找到可匹配的法规信源",
+            "text": text,
+            "references": references,
+            "search_time": time.time() - start_time,
+        }
+        return json.dumps(payload, ensure_ascii=False)
+
+    def _ensure_built(self) -> None:
+        ensure_law_database_ready()
+        self._ensure_indexes()
+
+    def _ensure_indexes(self) -> None:
+        """旧库没有 articles(law_id) 索引，按法律取条文会全表扫描；缺失时补建。"""
+        try:
+            with closing(self._connect()) as conn:
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_articles_law_id ON articles(law_id)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_laws_name ON laws(law_name)")
+                conn.commit()
+        except sqlite3.OperationalError:
+            pass
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    @staticmethod
+    def _law_alias_rank(row: sqlite3.Row) -> tuple[int, int]:
+        """同名别名常被一个法律家族共享：「刑法」同时是刑法典、各部修正案与罪名
+        补充规定的别名，「民法」同时是民法典与时间效力规定的别名。只按施行日定
+        胜负会把别的家族成员（甚至毫不相干的司法解释）当成命中。
+
+        首选「去掉尾部括注后仍以该别名结尾」的法律——别名是它本名的尾巴，
+        而不是借来的简称（中华人民共和国刑法 以 刑法 结尾；刑法修正案(二) 以
+        修正案 结尾）。同分再取更短别名（更精确），最后才是施行日新旧。
+        """
+        core_name = FILE_TITLE_PAREN_RE.sub("", row["law_name"]).strip()
+        return (
+            0 if core_name.endswith(row["alias"] or "") else 1,
+            len(row["alias"] or ""),
+        )
+
+    def _find_law_by_name(self, law_name: str) -> Optional[sqlite3.Row]:
+        query = normalize_title(law_name)
+        if not query:
+            return None
+
+        def rank_candidates(rows: list[sqlite3.Row]) -> list[sqlite3.Row]:
+            rows.sort(key=lambda row: row["implement_date"] or "", reverse=True)
+            rows.sort(key=self._law_alias_rank)
+            return rows
+
+        with closing(self._connect()) as conn:
+            exact_rows = conn.execute(
+                """
+                SELECT laws.*, law_aliases.alias AS alias
+                FROM law_aliases
+                JOIN laws ON laws.id = law_aliases.law_id
+                WHERE law_aliases.normalized_alias = ?
+                """,
+                (query,),
+            ).fetchall()
+            if exact_rows:
+                return rank_candidates(exact_rows)[0]
+
+            if len(query) < MIN_PARTIAL_TITLE_CHARS:
+                return None
+
+            # 部分匹配收紧：无约束的双向 instr 会让 2 字泛化别名（如「民法」）命中任何
+            # 含「民法」的查询，再任选一部同别名法律，把别的法律的同号法条当精确命中
+            # 返回（success=true、附 URL 与全文）。约束：
+            # 1. ≤2 字别名只允许参与精确别名分支，不参与双向 instr；
+            # 2. 要么查询完整出现在别名里（短名查全称），要么别名覆盖查询的一半以上
+            #    （查询是别名的轻度变体），纯碎片不落匹配；
+            # 3. 命中多个时按 _law_alias_rank 裁决，不再只看施行日期。
+            partial_rows = conn.execute(
+                """
+                SELECT DISTINCT laws.*, law_aliases.alias AS alias
+                FROM law_aliases
+                JOIN laws ON laws.id = law_aliases.law_id
+                WHERE LENGTH(law_aliases.alias) >= 3
+                  AND (instr(law_aliases.normalized_alias, ?) > 0
+                       OR (instr(?, law_aliases.normalized_alias) > 0
+                           AND LENGTH(law_aliases.alias) * 2 >= LENGTH(?)))
+                """,
+                (query, query, query),
+            ).fetchall()
+            if not partial_rows:
+                return None
+            return rank_candidates(partial_rows)[0]
+
+    def _find_law_mentions(self, message: str, limit: int) -> List[Tuple[str, str]]:
+        normalized_message = normalize_title(message)
+        if not normalized_message:
+            return []
+
+        matches: List[Tuple[str, str, int]] = []
+        with closing(self._connect()) as conn:
+            cursor = conn.execute(
+                """
+                SELECT laws.law_name, laws.url, law_aliases.alias, law_aliases.normalized_alias
+                FROM law_aliases
+                JOIN laws ON laws.id = law_aliases.law_id
+                WHERE LENGTH(law_aliases.alias) >= 2
+                """
+            )
+            seen_titles = set()
+            for row in cursor:
+                alias = row["normalized_alias"]
+                if alias not in normalized_message:
+                    continue
+                law_name = row["law_name"]
+                if law_name in seen_titles:
+                    continue
+                seen_titles.add(law_name)
+                matches.append((law_name, row["url"], len(alias), row["alias"]))
+
+        # 先全表扫完再排序截断：短别名（刑法/民法）被十几部法律共享，游标顺序里
+        # 先到先得会把裸引用解析到毫不相干的罪名补充规定上。排序口径与
+        # _law_alias_rank 一致（本名以别名结尾者优先），再按别名从长到短消歧义。
+        matches.sort(
+            key=lambda item: (
+                self._law_alias_rank(
+                    {"law_name": item[0], "alias": item[3]}
+                ),
+                -item[2],
+                len(item[0]),
+            )
+        )
+        return [(law_name, url) for law_name, url, _, _ in matches[:limit]]
+
+    def _extract_unquoted_citations(self, message: str, limit: int) -> List[Tuple[str, str]]:
+        citations: List[Tuple[str, str]] = []
+        seen = set()
+        for match in ARTICLE_NUMBER_RE.finditer(message or ""):
+            prefix = (message or "")[max(0, match.start() - 40):match.start()]
+            candidates = self._find_law_mentions(prefix, 1)
+            if not candidates:
+                continue
+            title = candidates[0][0]
+            number = match.group(0)
+            key = (title, number)
+            if key in seen:
+                continue
+            seen.add(key)
+            citations.append(key)
+            if len(citations) >= limit:
+                break
+        return citations
+
+
+def chinese_to_int(value: str) -> Optional[int]:
+    if not value:
+        return None
+    if value.isdigit():
+        return int(value)
+
+    total = 0
+    section = 0
+    number = 0
+    for char in value:
+        if char in CN_NUM:
+            number = CN_NUM[char]
+        elif char in CN_UNIT:
+            unit = CN_UNIT[char]
+            if unit == 10000:
+                section = (section + (number or 0)) * unit
+                total += section
+                section = 0
+            else:
+                section += (number or 1) * unit
+            number = 0
+        else:
+            return None
+    return total + section + number
+
+
+def normalize_article_number(article_number: str) -> str:
+    match = ARTICLE_NUMBER_RE.search((article_number or "").replace(" ", ""))
+    if not match:
+        return ""
+    main = chinese_to_int(match.group("main"))
+    sub = chinese_to_int(match.group("sub")) if match.group("sub") else None
+    if main is None:
+        return ""
+    return f"{main}-{sub}" if sub is not None else str(main)
+
+
+def normalize_title(title: str) -> str:
+    text = (title or "").strip()
+    text = text.replace("《", "").replace("》", "")
+    text = (
+        text.replace("（", "(")
+        .replace("）", ")")
+        .replace("“", "")
+        .replace("”", "")
+        .replace("‘", "")
+        .replace("’", "")
+    )
+    text = clean_title(text)
+    text = text.replace("(", "").replace(")", "")
+    text = re.sub(r"[\s\-—_·•:：,，.。/\\]+", "", text)
+    return text
+
+
+def normalize_query(query: str) -> str:
+    return re.sub(r"\s+", " ", (query or "").strip())
+
+
+def trim_text(value: str, max_chars: int) -> str:
+    text = str(value or "").strip()
+    return text[:max_chars]
+
+
+def normalize_limit(limit: int, default: int = 5) -> int:
+    try:
+        value = int(limit)
+    except (TypeError, ValueError):
+        value = default
+    return min(max(value, 1), MAX_SEARCH_LIMIT)
+
+
+def clean_title(raw_title: str) -> str:
+    title = (raw_title or "").strip()
+    title = TITLE_SUFFIX_RE.sub("", title).strip()
+    return title
+
+
+def extract_title(text: str, file_stem: str) -> str:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    for idx, line in enumerate(lines):
+        if line.startswith("URL:"):
+            if idx + 1 < len(lines):
+                return clean_title(lines[idx + 1])
+            break
+    fallback = file_stem.replace("_", " ").strip()
+    return clean_title(fallback)
+
+
+def extract_metadata(text: str) -> Dict[str, str]:
+    fields = {
+        "url": r"^URL:\s*(.+)$",
+        "cli": r"^【法宝引证码】\s*(.+)$",
+        "effectiveness": r"^时效性：\s*(.+)$",
+        "publish_date": r"^公布日期：\s*(.+)$",
+        "implement_date": r"^施行日期：\s*(.+)$",
+    }
+    metadata: Dict[str, str] = {}
+    for key, pattern in fields.items():
+        match = re.search(pattern, text, re.MULTILINE)
+        metadata[key] = match.group(1).strip() if match else ""
+    return metadata
+
+
+def build_aliases(title: str) -> List[str]:
+    variants = {title}
+    collapsed = FILE_TITLE_PAREN_RE.sub("", title).strip()
+    if collapsed:
+        variants.add(collapsed)
+    no_prefix = re.sub(r"^中华人民共和国", "", collapsed or title).strip()
+    if no_prefix:
+        variants.add(no_prefix)
+    if no_prefix.endswith("法") or no_prefix.endswith("典") or no_prefix.endswith("条例") or no_prefix.endswith("规定"):
+        variants.add(no_prefix)
+    return sorted({item for item in variants if len(item) >= 2}, key=len)
+
+
+def extract_articles(text: str) -> List[Tuple[str, str]]:
+    matches = list(ARTICLE_HEADER_RE.finditer(text))
+    articles: List[Tuple[str, str]] = []
+    for index, match in enumerate(matches):
+        start = match.end()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        content = clean_article_content(text[start:end])
+        article_number = match.group("number").strip()
+        if content:
+            articles.append((article_number, content))
+    return articles
+
+
+def clean_article_content(content: str) -> str:
+    cleaned_lines = []
+    for line in content.splitlines():
+        stripped = line.strip().strip("\u3000")
+        if not stripped:
+            continue
+        if stripped in {"展开", "收起", "引用本法"}:
+            continue
+        if stripped.startswith("法宝联想"):
+            break
+        if re.match(r"^第[一二三四五六七八九十百千万零〇两0-9]+章", stripped):
+            continue
+        cleaned_lines.append(stripped)
+    return "\n".join(cleaned_lines).strip()
+
+
+def iter_source_files() -> List[Path]:
+    return sorted(
+        path
+        for path in RAW_DATA_DIR.rglob("*")
+        if path.is_file()
+        and path.name != "index.json"
+        and path.suffix.lower() in {".json", ".txt", ".md"}
+    )
+
+
+def parse_source_file(source_file: Path) -> Optional[SourceLaw]:
+    if source_file.suffix.lower() == ".json":
+        return parse_json_source_file(source_file)
+    return parse_text_source_file(source_file)
+
+
+def parse_json_source_file(source_file: Path) -> Optional[SourceLaw]:
+    payload = json.loads(source_file.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        return None
+
+    law_name = clean_title(str(payload.get("law_name") or source_file.stem))
+    short_name = clean_title(str(payload.get("short_name") or ""))
+    articles = extract_json_articles(payload.get("articles"))
+    if not law_name or not articles:
+        return None
+
+    metadata = {
+        "url": str(payload.get("url") or "").strip(),
+        "cli": str(payload.get("cli") or "").strip(),
+        "effectiveness": str(payload.get("effectiveness") or "").strip(),
+        "publish_date": str(payload.get("publish_date") or "").strip(),
+        "implement_date": str(payload.get("implement_date") or "").strip(),
+    }
+    return SourceLaw(
+        law_name=law_name,
+        short_name=short_name,
+        metadata=metadata,
+        articles=articles,
+        category=source_file.parent.name,
+    )
+
+
+def extract_json_articles(raw_articles: object) -> List[Tuple[str, str]]:
+    articles: List[Tuple[str, str]] = []
+    if isinstance(raw_articles, dict):
+        for article_number, content in raw_articles.items():
+            number = str(article_number or "").strip()
+            body = clean_article_content(str(content or ""))
+            if number and body:
+                articles.append((number, body))
+    elif isinstance(raw_articles, list):
+        for item in raw_articles:
+            if not isinstance(item, dict):
+                continue
+            number = str(
+                item.get("article_number")
+                or item.get("number")
+                or item.get("title")
+                or ""
+            ).strip()
+            body = clean_article_content(str(item.get("content") or item.get("text") or ""))
+            if number and body:
+                articles.append((number, body))
+    return articles
+
+
+def parse_text_source_file(source_file: Path) -> Optional[SourceLaw]:
+    text = source_file.read_text(encoding="utf-8", errors="ignore")
+    law_name = extract_title(text, source_file.stem)
+    articles = extract_articles(text)
+    if not law_name or not articles:
+        return None
+
+    return SourceLaw(
+        law_name=law_name,
+        short_name="",
+        metadata=extract_metadata(text),
+        articles=articles,
+        category=source_file.parent.name,
+    )
+
+
+def build_source_manifest() -> Dict[str, object]:
+    file_paths = iter_source_files()
+    digest = hashlib.sha256()
+    latest_mtime_ns = 0
+    total_size = 0
+    files: Dict[str, Dict[str, object]] = {}
+    # 文件大小与 mtime 均未变时复用上次的 sha256，避免每次启动重读全部语料。
+    cached = (read_cached_manifest() or {}).get("files")
+    cached_files = cached if isinstance(cached, dict) else {}
+
+    for path in file_paths:
+        stat = path.stat()
+        latest_mtime_ns = max(latest_mtime_ns, stat.st_mtime_ns)
+        total_size += stat.st_size
+        relative_path = path.relative_to(RAW_DATA_DIR).as_posix()
+        previous = cached_files.get(relative_path)
+        if (
+            isinstance(previous, dict)
+            and previous.get("size") == stat.st_size
+            and previous.get("mtime_ns") == stat.st_mtime_ns
+            and previous.get("sha256")
+        ):
+            file_sha256 = str(previous["sha256"])
+        else:
+            file_sha256 = hash_file(path)
+        files[relative_path] = {
+            "size": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+            "sha256": file_sha256,
+        }
+        digest.update(relative_path.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(file_sha256.encode("ascii"))
+        digest.update(b"\0")
+
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "file_count": len(file_paths),
+        "latest_mtime_ns": latest_mtime_ns,
+        "total_size": total_size,
+        "content_sha256": digest.hexdigest(),
+        "files": files,
+    }
+
+
+def hash_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def read_cached_manifest() -> Optional[Dict[str, object]]:
+    if not MANIFEST_PATH.exists():
+        return None
+    try:
+        payload = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def manifest_rebuild_key(manifest: Optional[Dict[str, object]]) -> Optional[Dict[str, object]]:
+    if manifest is None:
+        return None
+    return {
+        "schema_version": manifest.get("schema_version"),
+        "file_count": manifest.get("file_count"),
+        "total_size": manifest.get("total_size"),
+        "content_sha256": manifest.get("content_sha256"),
+        "files": normalize_manifest_files(manifest.get("files")),
+    }
+
+
+def normalize_manifest_files(raw_files: object) -> Dict[str, Dict[str, object]]:
+    if not isinstance(raw_files, dict):
+        return {}
+    normalized: Dict[str, Dict[str, object]] = {}
+    for relative_path, entry in raw_files.items():
+        if not isinstance(relative_path, str) or not isinstance(entry, dict):
+            continue
+        normalized[relative_path] = {
+            "size": entry.get("size"),
+            "sha256": entry.get("sha256"),
+        }
+    return normalized
+
+
+def needs_rebuild(source_manifest: Dict[str, object]) -> bool:
+    if not DB_PATH.exists():
+        return True
+    current = read_cached_manifest()
+    if current is None:
+        return True
+    return manifest_rebuild_key(current) != manifest_rebuild_key(source_manifest)
+
+
+@contextmanager
+def database_build_lock():
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    lock_path = CACHE_DIR / "build.lock"
+    with lock_path.open("a+", encoding="utf-8") as lock_file:
+        if fcntl is not None:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def write_manifest(source_manifest: Dict[str, object]) -> None:
+    MANIFEST_PATH.write_text(
+        json.dumps(source_manifest, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def ensure_law_database_ready(*, force_rebuild: bool = False) -> Dict[str, object]:
+    with BUILD_LOCK:
+        with database_build_lock():
+            source_manifest = build_source_manifest()
+            cached_manifest = read_cached_manifest()
+            if not force_rebuild and not needs_rebuild(source_manifest):
+                return {
+                    "rebuilt": False,
+                    "mode": "unchanged",
+                    "file_count": source_manifest["file_count"],
+                    "content_sha256": source_manifest["content_sha256"],
+                }
+
+            if force_rebuild or not can_incremental_rebuild(cached_manifest):
+                full_rebuild(source_manifest)
+                return {
+                    "rebuilt": True,
+                    "mode": "full",
+                    "file_count": source_manifest["file_count"],
+                    "content_sha256": source_manifest["content_sha256"],
+                }
+
+            changes = sync_database_incremental(source_manifest, cached_manifest or {})
+            write_manifest(source_manifest)
+            return {
+                "rebuilt": True,
+                "mode": "incremental",
+                "file_count": source_manifest["file_count"],
+                "content_sha256": source_manifest["content_sha256"],
+                **changes,
+            }
+
+
+def can_incremental_rebuild(cached_manifest: Optional[Dict[str, object]]) -> bool:
+    return (
+        DB_PATH.exists()
+        and cached_manifest is not None
+        and cached_manifest.get("schema_version") == SCHEMA_VERSION
+        and bool(cached_manifest.get("files"))
+    )
+
+
+def full_rebuild(source_manifest: Dict[str, object]) -> None:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    temp_db = DB_PATH.with_suffix(".tmp")
+    for suffix in ("", "-wal", "-shm"):
+        candidate = Path(f"{temp_db}{suffix}")
+        if candidate.exists():
+            candidate.unlink()
+    build_database(temp_db)
+    for suffix in ("-wal", "-shm"):
+        candidate = Path(f"{DB_PATH}{suffix}")
+        if candidate.exists():
+            candidate.unlink()
+    temp_db.replace(DB_PATH)
+    for suffix in ("-wal", "-shm"):
+        candidate = Path(f"{temp_db}{suffix}")
+        if candidate.exists():
+            candidate.unlink()
+    write_manifest(source_manifest)
+
+
+def changed_source_paths(
+    source_manifest: Dict[str, object],
+    cached_manifest: Dict[str, object],
+) -> Tuple[List[str], List[str]]:
+    source_files = normalize_manifest_files(source_manifest.get("files"))
+    cached_files = normalize_manifest_files(cached_manifest.get("files"))
+    removed = sorted(path for path in cached_files if path not in source_files)
+    changed = sorted(
+        path
+        for path, entry in source_files.items()
+        if cached_files.get(path) != entry
+    )
+    return changed, removed
+
+
+def should_skip_source_law(parsed: SourceLaw) -> bool:
+    effectiveness = parsed.metadata.get("effectiveness", "")
+    return any(keyword in effectiveness for keyword in SKIP_EFFECTIVENESS_KEYWORDS)
+
+
+def insert_source_law(conn: sqlite3.Connection, source_file: Path, parsed: SourceLaw) -> int:
+    metadata = parsed.metadata
+    title = parsed.law_name
+
+    aliases = build_aliases(title)
+    if parsed.short_name and parsed.short_name not in aliases:
+        aliases.insert(1 if len(aliases) > 1 else len(aliases), parsed.short_name)
+    short_name = parsed.short_name or (aliases[1] if len(aliases) > 1 else aliases[0])
+    law_key = source_file.relative_to(RAW_DATA_DIR).as_posix()
+
+    cursor = conn.execute(
+        """
+        INSERT INTO laws (
+            law_key, law_name, short_name, category, url, cli,
+            effectiveness, publish_date, implement_date
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            law_key,
+            title,
+            short_name,
+            parsed.category,
+            metadata.get("url", ""),
+            metadata.get("cli", ""),
+            metadata.get("effectiveness", ""),
+            metadata.get("publish_date", ""),
+            metadata.get("implement_date", ""),
+        ),
+    )
+    law_id = cursor.lastrowid
+
+    conn.executemany(
+        "INSERT INTO law_aliases (law_id, alias, normalized_alias) VALUES (?, ?, ?)",
+        [(law_id, alias, normalize_title(alias)) for alias in aliases],
+    )
+
+    article_rows = []
+    for article_number, content in parsed.articles:
+        normalized_article = normalize_article_number(article_number)
+        if not normalized_article:
+            continue
+        search_blob = "\n".join(
+            [
+                title,
+                short_name,
+                parsed.category,
+                article_number,
+                content,
+            ]
+        )
+        article_rows.append(
+            (
+                law_id,
+                article_number,
+                normalized_article,
+                content,
+                search_blob,
+                search_blob.replace(" ", ""),
+            )
+        )
+
+    conn.executemany(
+        """
+        INSERT INTO articles (
+            law_id, article_number, normalized_article, content, search_blob,
+            search_blob_compact
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        article_rows,
+    )
+    return len(article_rows)
+
+
+def build_database(db_path: Path) -> None:
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.executescript(
+            """
+            CREATE TABLE laws (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                law_key TEXT UNIQUE NOT NULL,
+                law_name TEXT NOT NULL,
+                short_name TEXT NOT NULL,
+                category TEXT NOT NULL,
+                url TEXT NOT NULL,
+                cli TEXT NOT NULL,
+                effectiveness TEXT NOT NULL,
+                publish_date TEXT NOT NULL,
+                implement_date TEXT NOT NULL
+            );
+
+            CREATE TABLE law_aliases (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                law_id INTEGER NOT NULL,
+                alias TEXT NOT NULL,
+                normalized_alias TEXT NOT NULL,
+                FOREIGN KEY(law_id) REFERENCES laws(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE articles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                law_id INTEGER NOT NULL,
+                article_number TEXT NOT NULL,
+                normalized_article TEXT NOT NULL,
+                content TEXT NOT NULL,
+                search_blob TEXT NOT NULL,
+                search_blob_compact TEXT NOT NULL,
+                FOREIGN KEY(law_id) REFERENCES laws(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX idx_law_aliases_normalized ON law_aliases(normalized_alias);
+            CREATE INDEX idx_articles_normalized ON articles(normalized_article);
+            CREATE INDEX idx_articles_law_id ON articles(law_id);
+            CREATE INDEX idx_laws_name ON laws(law_name);
+            """
+        )
+
+        fts_ready = False
+        try:
+            # trigram 分词让 MATCH 支持子串检索；search_blob_compact 与打分函数
+            # 的去空格口径一致。老版本 SQLite 不支持时静默跳过，检索端回退 LIKE。
+            conn.executescript(
+                f"""
+                CREATE VIRTUAL TABLE {_FTS_TABLE_NAME} USING fts5(
+                    search_blob_compact,
+                    content='articles',
+                    content_rowid='id',
+                    tokenize='trigram'
+                );
+                """
+            )
+            fts_ready = True
+        except sqlite3.OperationalError:
+            fts_ready = False
+
+        for source_file in iter_source_files():
+            parsed = parse_source_file(source_file)
+            if parsed is None or should_skip_source_law(parsed):
+                continue
+
+            insert_source_law(conn, source_file, parsed)
+
+        if fts_ready:
+            conn.execute(
+                f"INSERT INTO {_FTS_TABLE_NAME}(rowid, search_blob_compact) "
+                "SELECT id, search_blob_compact FROM articles"
+            )
+
+        conn.commit()
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    finally:
+        conn.close()
+
+
+def sync_database_incremental(
+    source_manifest: Dict[str, object],
+    cached_manifest: Dict[str, object],
+) -> Dict[str, int]:
+    changed, removed = changed_source_paths(source_manifest, cached_manifest)
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        deleted_laws = delete_laws_by_keys(conn, [*removed, *changed])
+        indexed_laws = 0
+        skipped_laws = 0
+        indexed_articles = 0
+
+        for relative_path in changed:
+            source_file = RAW_DATA_DIR / relative_path
+            parsed = parse_source_file(source_file)
+            if parsed is None or should_skip_source_law(parsed):
+                skipped_laws += 1
+                continue
+            indexed_articles += insert_source_law(conn, source_file, parsed)
+            indexed_laws += 1
+
+        # 增量路径直接增删 articles 行，外部内容 FTS 表必须整体重建才与内容一致。
+        _rebuild_fts_index(conn)
+        conn.commit()
+        return {
+            "changed_files": len(changed),
+            "removed_files": len(removed),
+            "deleted_laws": deleted_laws,
+            "indexed_laws": indexed_laws,
+            "skipped_laws": skipped_laws,
+            "indexed_articles": indexed_articles,
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def delete_laws_by_keys(conn: sqlite3.Connection, law_keys: Sequence[str]) -> int:
+    deleted = 0
+    for law_key in law_keys:
+        rows = conn.execute("SELECT id FROM laws WHERE law_key = ?", (law_key,)).fetchall()
+        for row in rows:
+            law_id = row[0]
+            conn.execute("DELETE FROM law_aliases WHERE law_id = ?", (law_id,))
+            conn.execute("DELETE FROM articles WHERE law_id = ?", (law_id,))
+            conn.execute("DELETE FROM laws WHERE id = ?", (law_id,))
+            deleted += 1
+    return deleted
+
+
+def build_query_terms(query: str) -> List[str]:
+    parts = [part for part in re.split(r"[\s,，。；;、/]+", query) if part]
+    ordered = []
+    seen = set()
+    for item in [query, *parts]:
+        token = item.strip()
+        if not token or token in seen:
+            continue
+        seen.add(token)
+        ordered.append(token)
+        if len(ordered) >= MAX_QUERY_TERMS:
+            break
+        for alias in QUERY_SYNONYMS.get(token, []):
+            if alias not in seen:
+                seen.add(alias)
+                ordered.append(alias)
+                if len(ordered) >= MAX_QUERY_TERMS:
+                    break
+        if len(ordered) >= MAX_QUERY_TERMS:
+            break
+    return ordered
+
+
+MAX_LIKE_PREFILTER_TERMS = 8
+_LIKE_MIN_TERM_CHARS = 2
+# trigram 分词器要求查询串至少 3 个字符，更短的词回退 LIKE 预过滤。
+_FTS_MIN_TERM_CHARS = 3
+
+
+def _compact_query_terms(query: str, terms: Sequence[str]) -> List[str]:
+    """去空格后的去重打分词（与 score_article 的包含判断同口径），限长保序。"""
+    compact_terms: List[str] = []
+    seen: set[str] = set()
+    for raw_term in [query, *terms]:
+        compact = raw_term.replace(" ", "")
+        if len(compact) < _LIKE_MIN_TERM_CHARS or compact in seen:
+            continue
+        seen.add(compact)
+        compact_terms.append(compact)
+        if len(compact_terms) >= MAX_LIKE_PREFILTER_TERMS:
+            break
+    return compact_terms
+
+
+def _like_patterns_for(compact_terms: Sequence[str]) -> List[str]:
+    r"""把去空格打分词转义成 `%term%` LIKE 模式（%/_/\ 转义，配 ESCAPE '\'）。
+
+    子串包含语义必须由两侧 % 通配符表达；漏加会把 LIKE 退化成整串相等比较，
+    短词兜底路径会静默漏检。
+    """
+    patterns: List[str] = []
+    for compact in compact_terms:
+        if len(compact) < _LIKE_MIN_TERM_CHARS:
+            continue
+        escaped = (
+            compact.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        )
+        patterns.append(f"%{escaped}%")
+    return patterns
+
+
+def build_like_prefilter(query: str, terms: Sequence[str]) -> Tuple[str, List[str]]:
+    """生成 `REPLACE(search_blob,' ','') LIKE ?` 的 OR 预过滤子句。
+
+    与 score_article 的包含判断保持同语义：两边都先去掉空格再做子串匹配。
+    LIKE 对 ASCII 大小写不敏感只会多选，多出的行仍由精确打分剔除。
+    """
+    patterns = _like_patterns_for(_compact_query_terms(query, terms))
+    if not patterns:
+        return "", []
+    clause = " OR ".join(
+        "REPLACE(articles.search_blob, ' ', '') LIKE ? ESCAPE '\\'"
+        for _ in patterns
+    )
+    return clause, patterns
+
+
+_FTS_TABLE_NAME = "articles_fts"
+
+
+def fts_index_available(conn: sqlite3.Connection) -> bool:
+    """articles_fts 虚拟表是否存在（旧库或 trigram 不可用时缺失）。"""
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (_FTS_TABLE_NAME,),
+    ).fetchone()
+    return row is not None
+
+
+def _fts_match_expr(compact_terms: Sequence[str]) -> str:
+    return " OR ".join(
+        f'"{term.replace(chr(34), chr(34) * 2)}"' for term in compact_terms
+    )
+
+
+def _rebuild_fts_index(conn: sqlite3.Connection) -> None:
+    """按 articles 内容全量重建 FTS 索引；表缺失或 trigram 不可用时静默跳过。"""
+    if not fts_index_available(conn):
+        return
+    conn.execute(f"INSERT INTO {_FTS_TABLE_NAME}({_FTS_TABLE_NAME}) VALUES('rebuild')")
+
+
+def score_article(row: sqlite3.Row, query: str, terms: Sequence[str]) -> int:
+    search_blob = row["search_blob"]
+    compact_blob = search_blob.replace(" ", "")
+    compact_query = query.replace(" ", "")
+    score = 0
+    matched_terms = 0
+
+    if compact_query and compact_query in compact_blob:
+        score += 30
+
+    for term in terms:
+        compact_term = term.replace(" ", "")
+        if len(compact_term) <= 1:
+            continue
+        count = compact_blob.count(compact_term)
+        if not count:
+            continue
+        matched_terms += 1
+        if compact_term in normalize_title(row["law_name"]):
+            score += 16 + min(count, 3)
+        elif compact_term in row["article_number"]:
+            score += 10 + min(count, 2)
+        else:
+            score += 5 + min(count, 3)
+    if matched_terms:
+        score += matched_terms * 12
+    return score
+
+
+def extract_quoted_citations(message: str) -> List[Tuple[str, str]]:
+    citations = []
+    for match in QUOTED_CITATION_RE.finditer(message or ""):
+        citations.append((match.group("title"), match.group("number")))
+    return citations
+
+
+def format_references(references: Iterable[Dict[str, str]]) -> str:
+    lines = []
+    for index, item in enumerate(references, start=1):
+        title = item.get("title", "")
+        article_number = item.get("article_number", "")
+        url = item.get("url", "")
+        prefix = f"{index}. 《{title}》{article_number}".strip()
+        if url:
+            lines.append(f"{prefix}: {url}")
+        else:
+            lines.append(prefix)
+    return "\n".join(lines)
+
+
+_ENGINE: Optional[LawSearchEngine] = None
+_ENGINE_LOCK = threading.Lock()
+
+
+def get_engine() -> LawSearchEngine:
+    global _ENGINE
+    if _ENGINE is None:
+        with _ENGINE_LOCK:
+            if _ENGINE is None:
+                _ENGINE = LawSearchEngine()
+    return _ENGINE
+
+
+def law_exact_search(law_name: str, number: str) -> str:
+    return get_engine().exact_search(law_name, number)
+
+
+def law_fuzzy_search(keyword: str, limit: int = 5) -> str:
+    return get_engine().fuzzy_search(keyword, limit)
+
+
+def law_bm25_search(phrases: Sequence[str], limit: int = 20) -> str:
+    return get_engine().bm25_search(phrases, limit)
+
+
+def law_term_doc_freq(term: str) -> int:
+    return get_engine().term_doc_freq(term)
+
+
+def law_article_count() -> int:
+    return get_engine().article_count()
+
+
+def law_fetch_articles(pairs: Sequence[Tuple[str, str]]) -> str:
+    return get_engine().fetch_articles(pairs)
+
+
+def law_iter_articles(categories: Sequence[str] = ()) -> List[Dict[str, str]]:
+    return get_engine().iter_articles(categories)
+
+
+def law_link_search(message: str, limit: int = 5) -> str:
+    return get_engine().link_search(message, limit)
+
+
+if __name__ == "__main__":
+    engine = get_engine()
+    print(engine.exact_search("民法典", "第七条"))
+    print(engine.fuzzy_search("醉驾 处罚 标准 危险驾驶罪", limit=3))

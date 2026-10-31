@@ -1,0 +1,38 @@
+.env
+.env.*
+!.env.example
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+pytest-cache-files-*/
+*.egg-info/
+
+node_modules/
+dist/
+dist-demo/
+frontend/dist/
+frontend/dist-demo/
+frontend/.env.demo
+
+# Runtime data: conversations, profiles, case files and logs are personal. Only the reviewed
+# seed catalogues and the statute corpus ship with the repository.
+data/*.sqlite3
+data/**/*.sqlite3
+data/case_backups/
+data/case_import/
+data/script_import/
+data/institution_import/
+data/test_state/
+data/pytest-tmp/
+data/*.log
+*.log
+rag/cache/
+rag/import/
+rag/superseded/
+eval/.tmp/
+eval/llm_e2e_report.json
+
+# Vector indexes are derived from the corpus and need an embedding key to rebuild.
+*.vectors.npy
+*.vectors.json

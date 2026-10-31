@@ -1,0 +1,50 @@
+name: GitHub Pages demo
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - name: Build the static demo
+        env:
+          VITE_DEMO: "1"
+          VITE_BASE: /${{ github.event.repository.name }}/
+          VITE_DEMO_UNTIL: ${{ vars.DEMO_UNTIL }}
+          VITE_REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          npm ci
+          npx vite build --mode demo --outDir ../dist-demo --emptyOutDir
+          cp -r frontend/public/demo dist-demo/
+          cp dist-demo/index.html dist-demo/404.html
+          touch dist-demo/.nojekyll
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist-demo
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

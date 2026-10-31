@@ -1,0 +1,14 @@
+{
+ "ok": true,
+ "app": "WorkAid",
+ "demo": true,
+ "statute_rag": {
+  "available": true,
+  "source": "D:\\agent\\workaid\\rag\\data",
+  "documents": 5246,
+  "indexed": true
+ },
+ "vector_index": {
+  "index_ready": true
+ }
+}

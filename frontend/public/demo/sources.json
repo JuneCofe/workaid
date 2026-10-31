@@ -1,0 +1,72 @@
+{
+ "statutes": [
+  {
+   "title": "WorkAid 本地法律法规库",
+   "category": "法规总库",
+   "article_count": 5246,
+   "path": "D:\\agent\\workaid\\rag\\data",
+   "kind": "statute",
+   "categories": {
+    "司法解释": 283,
+    "地方性法规": 4053,
+    "法律": 322,
+    "监察法规": 9,
+    "行政法规": 572,
+    "部门规章": 7
+   }
+  }
+ ],
+ "cases": [
+  {
+   "title": "WorkAid 本地案例库",
+   "category": "案例",
+   "article_count": 45,
+   "path": "D:\\agent\\workaid\\data\\cases.jsonl",
+   "kind": "case",
+   "reviewed": 29,
+   "vector_ready": true
+  }
+ ],
+ "remote": [
+  {
+   "title": "华宇元典法律法规 MCP",
+   "category": "远端兜底",
+   "article_count": 0,
+   "path": "https://open.chineselaw.com/mcp/law/stream",
+   "kind": "yuandian-statute",
+   "configured": false
+  },
+  {
+   "title": "华宇元典案例文书 MCP",
+   "category": "远端兜底",
+   "article_count": 0,
+   "path": "https://open.chineselaw.com/mcp/case/stream",
+   "kind": "yuandian-case",
+   "configured": false
+  }
+ ],
+ "mcp_status": {
+  "provider": "华宇元典 MCP",
+  "configured": false,
+  "services": {
+   "statute": {
+    "configured": false,
+    "endpoint": "https://open.chineselaw.com/mcp/law/stream",
+    "tool": "yuandian_law_vector_search",
+    "transport": "Streamable HTTP"
+   },
+   "case": {
+    "configured": false,
+    "endpoint": "https://open.chineselaw.com/mcp/case/stream",
+    "tool": "yuandian_case_vector_search",
+    "transport": "Streamable HTTP"
+   }
+  }
+ },
+ "statute_status": {
+  "available": true,
+  "source": "D:\\agent\\workaid\\rag\\data",
+  "documents": 5246,
+  "indexed": true
+ }
+}
