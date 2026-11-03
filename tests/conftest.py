@@ -10,6 +10,9 @@ def _no_external_model_calls(monkeypatch):
     rerank._DOC_CACHE.clear()
     for name in (
         "OPENAI_API_KEY",
+        "MEMORY_DATABASE_URL",
+        "REDIS_URL",
+        "ANSWER_CACHE_TTL",
         "RERANK_API_URL",
         "RERANK_API_KEY",
         "RERANK_MODEL",

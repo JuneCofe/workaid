@@ -12,12 +12,17 @@ from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
 
+from . import answer_cache
 from . import casebase
 from . import directory, intake
 from . import privacy
 from . import profile as profile_module
 from .cases import case_sources
-from .config import CASE_CATALOG_PATH, DATABASE_PATH, INSTITUTIONS_PATH, ROOT
+from .answer_cache import AnswerCache, eligible, key_for
+from .config import (
+    ANSWER_CACHE_TTL, CASE_CATALOG_PATH, DATABASE_PATH, INSTITUTIONS_PATH,
+    MEMORY_DATABASE_URL, REDIS_URL, ROOT,
+)
 from .graph import LeaderGraph
 from .memory import MemoryStore
 from .rag import engine_status, search_statutes_traced, statute_sources
@@ -34,14 +39,18 @@ def create_app(
     database_path: Path | None = None,
     frontend_dir: Path | None = None,
 ) -> FastAPI:
-    store = MemoryStore(database_path or DATABASE_PATH)
+    store = MemoryStore(database_path or DATABASE_PATH, url=MEMORY_DATABASE_URL)
     leader = LeaderGraph(store)
     warmup = Warmup()
+    cache = AnswerCache(REDIS_URL, ANSWER_CACHE_TTL)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         warmup.start()
-        yield
+        try:
+            yield
+        finally:
+            store.db.close()
 
     app = FastAPI(
         title="WorkAid",
@@ -65,6 +74,8 @@ def create_app(
             "case_catalog": casebase.stats(CASE_CATALOG_PATH),
             "warmup": warmup.snapshot(),
             "yuandian_mcp": yuandian_mcp.status(),
+            "memory": {"engine": store.db.label},
+            "answer_cache": cache.status(),
         }
 
     @app.post("/api/cases/search")
@@ -90,21 +101,33 @@ def create_app(
         message = analysis.text
 
         conversation_id = request.conversation_id
+        first_turn = True
         if conversation_id is None:
             created = store.create_conversation(request.user_id, message.replace("\n", " ")[:60] or "新对话")
             conversation_id = created["id"]
-        elif store.get_conversation(conversation_id, request.user_id) is None:
-            raise HTTPException(status_code=404, detail="会话不存在")
+        else:
+            existing = store.get_conversation(conversation_id, request.user_id)
+            if existing is None:
+                raise HTTPException(status_code=404, detail="会话不存在")
+            first_turn = not existing["messages"]
 
         remembered: list[dict[str, str]] = []
         if analysis.remember and analysis.entities:
             remembered = profile_module.remember_entities(store, request.user_id, analysis.entities)
         store.add_message(conversation_id, request.user_id, "user", message)
         profile_module.update_from_text(store, request.user_id, message, conversation_id, use_model=False)
+        # Checked after this turn's profile update: the answer will see that profile, so it must be empty too.
+        profile = store.profile_for_prompt(request.user_id)
+        profile_empty = not (profile["facts"] or profile["preferences"] or profile["已了解的情况"])
+        shareable = eligible(
+            message, first_turn=first_turn, profile_empty=profile_empty,
+            redacted=bool(analysis.counts or remembered),
+        )
         return {
             "conversation_id": conversation_id,
             "message": message,
             "privacy": {"redacted": analysis.counts, "remembered": [item["key"] for item in remembered]},
+            "cache_key": key_for(message) if shareable else None,
         }
 
     def _end_turn(request: ChatRequest, turn: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
@@ -127,23 +150,51 @@ def create_app(
 
     def _after_reply(request: ChatRequest, turn: dict[str, Any]) -> None:
         """Model passes (extra profile facts, folding old turns into a summary) take seconds and only help
-        later turns, so they run after the reply has been sent."""
-        profile_module.update_with_model(store, request.user_id, turn["message"], turn["conversation_id"])
+        later turns, so they run after the reply has been sent. A cached reply skips the model pass."""
+        if not turn.get("cached"):
+            profile_module.update_with_model(store, request.user_id, turn["message"], turn["conversation_id"])
         profile_module.compress_if_needed(store, request.user_id, turn["conversation_id"])
+
+    def _cached_reply(turn: dict[str, Any]) -> dict[str, Any] | None:
+        if not turn.get("cache_key"):
+            return None
+        reply = cache.get(turn["cache_key"])
+        if reply is not None:
+            turn["cached"] = True
+        return reply
+
+    def _remember_reply(turn: dict[str, Any], result: dict[str, Any]) -> None:
+        if turn.get("cache_key") and not turn.get("cached") and result.get("answer"):
+            cache.set(turn["cache_key"], result)
 
     @app.post("/api/chat")
     def chat(request: ChatRequest, background: BackgroundTasks) -> dict[str, Any]:
         turn = _begin_turn(request)
-        try:
-            result = leader.run(user_id=request.user_id, conversation_id=turn["conversation_id"], message=turn["message"])
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        result = _cached_reply(turn)
+        if result is None:
+            try:
+                result = leader.run(user_id=request.user_id, conversation_id=turn["conversation_id"], message=turn["message"])
+            except KeyError as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+            _remember_reply(turn, result)
         response = _end_turn(request, turn, result)
         background.add_task(_after_reply, request, turn)
         return response
 
     def _sse(event: str, data: Any) -> str:
         return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+    def _replay(reply: dict[str, Any]):
+        """A cached reply in the same event sequence a live run produces, so the client needs no special case."""
+        yield {"event": "route", "data": {"intent": reply["intent"], "workers": [w["worker"] for w in reply["workers"]]}}
+        yield {"event": "stage", "data": {"name": "retrieve"}}
+        yield {"event": "worker", "data": {"outputs": reply["workers"], "evidence": reply["evidence"]}}
+        yield {"event": "stage", "data": {"name": "compose"}}
+        yield {"event": "stage", "data": {"name": "verify"}}
+        answer = reply["answer"]
+        for at in range(0, len(answer), 14):
+            yield {"event": "delta", "data": {"text": answer[at : at + 14]}}
+        yield {"event": "final", "data": reply}
 
     @app.post("/api/chat/stream")
     def chat_stream(request: ChatRequest) -> StreamingResponse:
@@ -154,15 +205,22 @@ def create_app(
         def events():
             yield _sse("meta", {"conversation_id": turn["conversation_id"], "privacy": turn["privacy"]})
             final = None
+            cached = _cached_reply(turn)
             try:
-                for item in leader.stream(
-                    user_id=request.user_id, conversation_id=turn["conversation_id"], message=turn["message"]
-                ):
+                if cached is not None:
+                    source = _replay(cached)
+                else:
+                    source = leader.stream(
+                        user_id=request.user_id, conversation_id=turn["conversation_id"], message=turn["message"]
+                    )
+                for item in source:
                     if item["event"] == "final":
                         final = item["data"]
                     else:
                         yield _sse(item["event"], item["data"])
                 if final is not None:
+                    if cached is None:
+                        _remember_reply(turn, final)
                     yield _sse("final", _end_turn(request, turn, final))
             except Exception:
                 logger.exception("streaming chat failed")

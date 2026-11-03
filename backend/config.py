@@ -19,3 +19,6 @@ INSTITUTIONS_PATH = _path_setting("INSTITUTIONS_PATH", ROOT / "data" / "institut
 RAG_DATA_DIR = ROOT / "rag" / "data"
 RAG_CACHE_DIR = ROOT / "rag" / "cache"
 MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "24"))
+MEMORY_DATABASE_URL = os.getenv("MEMORY_DATABASE_URL", "").strip()
+REDIS_URL = os.getenv("REDIS_URL", "").strip()
+ANSWER_CACHE_TTL = int(os.getenv("ANSWER_CACHE_TTL", "86400"))

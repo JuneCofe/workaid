@@ -1,15 +1,14 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 import threading
-from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 from uuid import uuid4
 
 from . import privacy
+from .db import Database
 
 _LOCK = threading.RLock()
 ITEM_TTL_DAYS = 180
@@ -36,76 +35,15 @@ def _expiry() -> str:
 
 
 class MemoryStore:
-    """SQLite conversation history plus durable, user-scoped profile memory."""
+    """Conversation history plus durable, user-scoped profile memory, in SQLite or PostgreSQL."""
 
-    def __init__(self, path: Path):
-        self.path = path
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as db:
-            db.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS conversations (
-                    id TEXT PRIMARY KEY,
-                    user_id TEXT NOT NULL,
-                    title TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS ix_conversations_user_updated
-                    ON conversations(user_id, updated_at DESC);
-                CREATE TABLE IF NOT EXISTS messages (
-                    id TEXT PRIMARY KEY,
-                    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-                    role TEXT NOT NULL,
-                    content TEXT NOT NULL,
-                    metadata TEXT NOT NULL DEFAULT '{}',
-                    created_at TEXT NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS ix_messages_conversation
-                    ON messages(conversation_id, created_at);
-                CREATE TABLE IF NOT EXISTS user_profiles (
-                    user_id TEXT PRIMARY KEY,
-                    facts TEXT NOT NULL DEFAULT '[]',
-                    preferences TEXT NOT NULL DEFAULT '{}',
-                    updated_at TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS profile_items (
-                    user_id TEXT NOT NULL,
-                    key TEXT NOT NULL,
-                    value TEXT NOT NULL,
-                    explicit INTEGER NOT NULL DEFAULT 0,
-                    sensitive INTEGER NOT NULL DEFAULT 0,
-                    confidence REAL NOT NULL DEFAULT 0.6,
-                    source TEXT NOT NULL DEFAULT '',
-                    first_seen TEXT NOT NULL,
-                    last_seen TEXT NOT NULL,
-                    expires_at TEXT,
-                    PRIMARY KEY (user_id, key, value)
-                );
-                CREATE TABLE IF NOT EXISTS case_files (
-                    conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
-                    data TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS conversation_summaries (
-                    conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
-                    summary TEXT NOT NULL,
-                    covered INTEGER NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-                """
-            )
+    def __init__(self, path: Path | None = None, *, url: str = ""):
+        self.db = Database(path, url)
+        self.path = self.db.path
+        self.db.create_schema()
 
-    @contextmanager
-    def _connect(self) -> Iterator[sqlite3.Connection]:
-        db = sqlite3.connect(self.path, timeout=10, check_same_thread=False)
-        db.row_factory = sqlite3.Row
-        db.execute("PRAGMA foreign_keys=ON")
-        try:
-            with db:
-                yield db
-        finally:
-            db.close()
+    def _connect(self):
+        return self.db.connect()
 
     def create_conversation(self, user_id: str, title: str) -> dict[str, Any]:
         conversation_id, now = str(uuid4()), _now()
@@ -141,7 +79,7 @@ class MemoryStore:
                 return None
             messages = db.execute(
                 "SELECT role, content, metadata, created_at FROM messages "
-                "WHERE conversation_id=? ORDER BY created_at, rowid",
+                "WHERE conversation_id=? ORDER BY created_at, id",
                 (conversation_id,),
             ).fetchall()
         return {
@@ -277,8 +215,10 @@ class MemoryStore:
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(user_id, key, value) DO UPDATE SET
                         last_seen=excluded.last_seen, expires_at=excluded.expires_at,
-                        confidence=MAX(confidence, excluded.confidence),
-                        explicit=MAX(explicit, excluded.explicit)
+                        confidence=CASE WHEN excluded.confidence > profile_items.confidence
+                                        THEN excluded.confidence ELSE profile_items.confidence END,
+                        explicit=CASE WHEN excluded.explicit > profile_items.explicit
+                                      THEN excluded.explicit ELSE profile_items.explicit END
                     """,
                     (user_id, key, value, int(explicit), int(sensitive), float(item.get("confidence", 0.6)),
                      str(item.get("source", ""))[:60], now, now, None if explicit else expires),
@@ -382,7 +322,7 @@ class MemoryStore:
         report: dict[str, Any] = {"messages": 0, "titles": 0, "kinds": {}}
         with _LOCK, self._connect() as db:
             for table, column, label in (("messages", "content", "messages"), ("conversations", "title", "titles")):
-                rows = db.execute(f"SELECT rowid, {column} FROM {table}").fetchall()
+                rows = db.execute(f"SELECT id, {column} FROM {table}").fetchall()
                 for row in rows:
                     result = privacy.analyze(row[column])
                     if not result.changed:
@@ -391,12 +331,8 @@ class MemoryStore:
                     for kind, number in result.counts.items():
                         report["kinds"][kind] = report["kinds"].get(kind, 0) + number
                     if apply:
-                        db.execute(f"UPDATE {table} SET {column}=? WHERE rowid=?", (result.text, row["rowid"]))
+                        db.execute(f"UPDATE {table} SET {column}=? WHERE id=?", (result.text, row["id"]))
         if apply:
-            db = sqlite3.connect(self.path)
-            try:
-                db.execute("VACUUM")
-            finally:
-                db.close()
+            self.db.vacuum()
         report["applied"] = apply
         return report
