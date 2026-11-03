@@ -28,7 +28,7 @@ HOLDOUT = Path(__file__).with_name("statute_holdout.jsonl")
 def main() -> None:
     verbose = "-v" in sys.argv[1:]
     holdout = "--holdout" in sys.argv[1:]
-    print(f"vector route: {'on' if embedding.enabled() and vector.get_index() else 'off'}")
+    print(f"vector route: {'on' if embedding.enabled() and vector.status()['index_ready'] else 'off'}")
     baseline, pipeline = run_comparison(load_cases(HOLDOUT) if holdout else None)
     for report in (baseline, pipeline):
         print(f"{report.name}: {report.summary()}")

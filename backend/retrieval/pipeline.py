@@ -1,15 +1,26 @@
 from __future__ import annotations
 
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from . import vector
 from .query import QueryPlan, understand
-from .recall import Recall, recall
-from .rerank import rerank
+from .recall import Candidate, Recall, recall
+from .rerank import POOL_SIZE, rerank
 
 VECTOR_TIMEOUT_SECONDS = 6
+VECTOR_TOP_K = 20
+RERANK_POOL = POOL_SIZE
+
+
+def vector_top_k() -> int:
+    return int(os.getenv("VECTOR_TOP_K", VECTOR_TOP_K))
+
+
+def rerank_pool() -> int:
+    return int(os.getenv("RRF_TOP_K", RERANK_POOL))
 
 
 def _vector_texts(plan: QueryPlan) -> list[str]:
@@ -20,15 +31,18 @@ def _vector_texts(plan: QueryPlan) -> list[str]:
     return [plan.original, formal, concept, llm]
 
 
-def search_local(module: Any, query: str, limit: int = 5) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Rewrite -> multi-route recall (keyword + BM25 + vector) -> rerank, with a stage trace."""
+def gather(module: Any, query: str) -> tuple[QueryPlan, list[Candidate], dict[str, Any]]:
+    """Rewrite the query, run the two recall routes in parallel, and fuse them with RRF.
+
+    Route A is embedding search in ChromaDB; route B is FTS5 BM25 over the rewritten terms. The embedding
+    request is network-bound, so it runs in a worker while the local route runs on this thread.
+    """
     started = time.perf_counter()
     plan: QueryPlan = understand(query)
     planned = time.perf_counter()
 
-    # The embedding request is network-bound, so it overlaps with the local keyword routes.
     pool = ThreadPoolExecutor(max_workers=1)
-    future = pool.submit(vector.search, module, _vector_texts(plan))
+    future = pool.submit(vector.search, module, _vector_texts(plan), vector_top_k())
     state = Recall()
     recall(module, plan, state=state)
     try:
@@ -46,22 +60,25 @@ def search_local(module: Any, query: str, limit: int = 5) -> tuple[list[dict[str
         scores = vector.score_candidates(vec_result, missing)
         for candidate in candidates:
             candidate.vec = max(candidate.vec, scores.get(candidate.key, 0.0))
-    raw_hits = state.raw_hits
     recalled = time.perf_counter()
-
-    items, rerank_trace = rerank(plan, candidates, limit, module)
-    done = time.perf_counter()
     trace = {
         **plan.trace(),
-        "recalled": raw_hits,
+        "recalled": state.raw_hits,
         "vector": vec_result is not None,
         "candidates": len(candidates),
-        **rerank_trace,
         "timings_ms": {
             "rewrite": round((planned - started) * 1000),
             "recall": round((recalled - planned) * 1000),
             "vector_wait": round((vec_done - planned) * 1000),
-            "rerank": round((done - recalled) * 1000),
         },
     }
-    return items, trace
+    return plan, candidates, trace
+
+
+def search_local(module: Any, query: str, limit: int = 5) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Rewrite -> two-route recall -> RRF -> cross-encoder rerank -> top-n, with a stage trace."""
+    plan, candidates, trace = gather(module, query)
+    started = time.perf_counter()
+    items, rerank_trace = rerank(plan, candidates, limit, module, pool_size=rerank_pool())
+    trace["timings_ms"]["rerank"] = round((time.perf_counter() - started) * 1000)
+    return items, {**trace, **rerank_trace}

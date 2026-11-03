@@ -74,9 +74,10 @@ def test_warmup_is_skipped_when_the_engine_is_missing_or_disabled(monkeypatch):
 def test_warmup_starts_with_the_app_and_health_reports_it(monkeypatch, tmp_path):
     from backend.retrieval import vector
 
-    monkeypatch.setattr(vector, "INDEX_PATH", tmp_path / "none.npy")
-    monkeypatch.setattr(vector, "META_PATH", tmp_path / "none.json")
-    vector._STATE.update(mtime=None, index=None)
+    monkeypatch.setattr(vector, "CHROMA_DIR", tmp_path / "none-chroma")
+    monkeypatch.setattr(vector, "LEGACY_INDEX_PATH", tmp_path / "none.npy")
+    monkeypatch.setattr(vector, "LEGACY_META_PATH", tmp_path / "none.json")
+    vector._CLIENTS.clear()
     monkeypatch.setattr(rag_module, "_load_engine", lambda: FakeEngine())
     app = create_app(database_path=tmp_path / "t.sqlite3", frontend_dir=tmp_path / "none")
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -8,9 +9,22 @@ from .query import QueryPlan
 
 RRF_K = 60
 PER_VARIANT_LIMIT = 15
+BM25_TOP_K = 10
 VECTOR_WEIGHT = 1.0
 # Whole clauses are not word lists, so a BM25 phrase query over them only adds noise.
 _BM25_SKIP_KINDS = {"original", "chunk"}
+
+
+def rrf_k() -> int:
+    return int(os.getenv("RRF_K", RRF_K))
+
+
+def bm25_top_k() -> int:
+    return int(os.getenv("BM25_TOP_K", BM25_TOP_K))
+
+
+def fuzzy_enabled() -> bool:
+    return os.getenv("RECALL_FUZZY", "1") != "0"
 
 
 @dataclass
@@ -54,14 +68,14 @@ def _normalize(item: dict[str, Any]) -> dict[str, Any]:
 
 
 def _absorb(pool: dict[tuple[str, str, str], Candidate], raw_hits: dict[str, int], route: str, weight: float,
-            items: list[dict[str, Any]]) -> None:
+            items: list[dict[str, Any]], k: int) -> None:
     raw_hits[route] += len(items)
     for rank, raw in enumerate(items, start=1):
         item = _normalize(raw)
         # Content prefix keeps a corrupted twin of an article from shadowing the real one.
         key = (item["law_name"], item["article_number"], item["content"][:30])
         candidate = pool.setdefault(key, Candidate(item))
-        candidate.rrf += weight / (RRF_K + rank)
+        candidate.rrf += weight / (k + rank)
         candidate.routes.add(route)
         candidate.lists += 1
         if route == "bm25" and isinstance(raw.get("bm25"), (int, float)):
@@ -72,14 +86,15 @@ def _absorb(pool: dict[tuple[str, str, str], Candidate], raw_hits: dict[str, int
 
 
 class Recall:
-    """Candidate pool shared by the keyword, BM25 and vector routes."""
+    """Candidate pool shared by the keyword, BM25 and vector routes, fused with weighted RRF."""
 
-    def __init__(self) -> None:
+    def __init__(self, k: int | None = None) -> None:
+        self.k = rrf_k() if k is None else k
         self.pool: dict[tuple[str, str, str], Candidate] = {}
         self.raw_hits = {"keyword": 0, "bm25": 0, "vector": 0}
 
     def add(self, route: str, weight: float, items: list[dict[str, Any]]) -> None:
-        _absorb(self.pool, self.raw_hits, route, weight, items)
+        _absorb(self.pool, self.raw_hits, route, weight, items, self.k)
 
     def add_vector(self, lists: list[list[dict[str, Any]]]) -> None:
         for items in lists:
@@ -90,15 +105,18 @@ class Recall:
 
 
 def recall(
-    module: Any, plan: QueryPlan, limit: int = PER_VARIANT_LIMIT, state: Recall | None = None
+    module: Any, plan: QueryPlan, limit: int = PER_VARIANT_LIMIT, state: Recall | None = None,
+    bm25_limit: int | None = None,
 ) -> tuple[list[Candidate], dict[str, int]]:
-    """Run every query variant through the keyword and BM25 routes and fuse the lists with weighted RRF."""
+    """Run every query variant through the FTS5 BM25 route (plus the optional LIKE route) and fuse with RRF."""
     state = state or Recall()
+    bm25_limit = bm25_top_k() if bm25_limit is None else bm25_limit
     for variant in plan.variants:
-        state.add("keyword", variant.weight, _call(module, "law_fuzzy_search", variant.text, limit=limit))
+        if fuzzy_enabled():
+            state.add("keyword", variant.weight, _call(module, "law_fuzzy_search", variant.text, limit=limit))
         if variant.kind in _BM25_SKIP_KINDS:
             continue
         phrases = [part for part in variant.text.split() if len(part) >= 3]
         if phrases:
-            state.add("bm25", variant.weight, _call(module, "law_bm25_search", phrases, limit=limit))
+            state.add("bm25", variant.weight, _call(module, "law_bm25_search", phrases, limit=bm25_limit))
     return state.candidates(), state.raw_hits

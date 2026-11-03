@@ -7,7 +7,7 @@ def _no_external_model_calls(monkeypatch):
     from backend.retrieval import rerank
 
     rerank._API_DOWN_UNTIL[0] = 0.0
-    rerank._API_CACHE.clear()
+    rerank._DOC_CACHE.clear()
     for name in (
         "OPENAI_API_KEY",
         "RERANK_API_URL",

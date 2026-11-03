@@ -17,17 +17,21 @@ from . import embedding
 from .lexicon import PSEUDO_STATUTE
 from .quality import classify
 
-INDEX_PATH = RAG_CACHE_DIR / "vectors.npy"
-META_PATH = RAG_CACHE_DIR / "vectors_meta.json"
+CHROMA_DIR = RAG_CACHE_DIR / "chroma"
+COLLECTION = "statutes"
+# The numpy index written before ChromaDB; imported once so the corpus is not embedded a second time.
+LEGACY_INDEX_PATH = RAG_CACHE_DIR / "vectors.npy"
+LEGACY_META_PATH = RAG_CACHE_DIR / "vectors_meta.json"
 # Statutes, administrative regulations and judicial interpretations; the regional corpus is large and
 # mostly irrelevant to an individual's case, so it stays keyword-only unless listed here explicitly.
 DEFAULT_CATEGORIES = ("法律", "行政法规", "司法解释", "部门规章")
 DEFAULT_MIN_COSINE = 0.35
 QUERY_CACHE_SIZE = 256
+WRITE_BATCH = 500
 
 _QUERY_CACHE: OrderedDict[str, list[float]] = OrderedDict()
 _LOCK = threading.Lock()
-_STATE: dict[str, Any] = {"mtime": None, "index": None}
+_CLIENTS: dict[str, Any] = {}
 
 
 def categories() -> tuple[str, ...]:
@@ -59,32 +63,8 @@ def _text_hash(text: str) -> str:
     return hashlib.sha1(text.encode("utf-8")).hexdigest()
 
 
-@dataclass
-class VectorIndex:
-    matrix: np.ndarray
-    rows: list[tuple[str, str, str]]
-    model: str
-
-    def __post_init__(self) -> None:
-        self.row_of = {(law, article): i for i, (law, article, _) in enumerate(self.rows)}
-
-    def top(self, queries: np.ndarray, k: int) -> list[list[tuple[int, float]]]:
-        scores = queries @ self.matrix.T
-        out: list[list[tuple[int, float]]] = []
-        for row in scores:
-            k_eff = min(k, row.shape[0])
-            part = np.argpartition(-row, k_eff - 1)[:k_eff]
-            part = part[np.argsort(-row[part])]
-            out.append([(int(i), float(row[i])) for i in part])
-        return out
-
-    def similarity(self, queries: np.ndarray, keys: Iterable[tuple[str, str]]) -> dict[tuple[str, str], float]:
-        found = {key: self.row_of[key] for key in keys if key in self.row_of}
-        if not found:
-            return {}
-        cols = np.array(list(found.values()))
-        best = (queries @ self.matrix[cols].T).max(axis=0)
-        return {key: float(score) for key, score in zip(found, best)}
+def _record_id(law: str, article: str) -> str:
+    return f"{law}\x1f{article}"
 
 
 def _normalize_rows(matrix: np.ndarray) -> np.ndarray:
@@ -92,66 +72,79 @@ def _normalize_rows(matrix: np.ndarray) -> np.ndarray:
     return matrix / np.where(norms == 0, 1, norms)
 
 
-def _read_raw() -> tuple[np.ndarray, list[tuple[str, str, str]], dict[str, Any]] | None:
-    try:
-        meta = json.loads(META_PATH.read_text(encoding="utf-8"))
-        matrix = np.load(INDEX_PATH)
-        rows = [(a, b, c) for a, b, c in meta["rows"]]
-    except (OSError, ValueError, KeyError):
-        return None
-    return (matrix, rows, meta) if matrix.shape[0] == len(rows) else None
+def _client() -> Any:
+    import chromadb
+    from chromadb.config import Settings
 
-
-def get_index() -> VectorIndex | None:
-    """Load the on-disk index (reloading when rebuilt); None if missing or built with another model."""
-    try:
-        mtime = (INDEX_PATH.stat().st_mtime_ns, META_PATH.stat().st_mtime_ns)
-    except OSError:
-        return None
+    path = str(CHROMA_DIR)
     with _LOCK:
-        if _STATE["mtime"] == mtime:
-            index = _STATE["index"]
-        else:
-            raw = _read_raw()
-            index = None
-            if raw is not None and raw[2].get("model") == embedding.model_name():
-                index = VectorIndex(raw[0].astype(np.float32), raw[1], raw[2]["model"])
-            _STATE.update(mtime=mtime, index=index)
-    return index
+        if path not in _CLIENTS:
+            CHROMA_DIR.mkdir(parents=True, exist_ok=True)
+            _CLIENTS[path] = chromadb.PersistentClient(path=path, settings=Settings(anonymized_telemetry=False))
+        return _CLIENTS[path]
+
+
+def _open(create: bool = False) -> Any | None:
+    """The statute collection, or None when nothing has been built yet.
+
+    A collection built with another embedding model is never queried: its vectors live in a different space.
+    With create=True it is replaced when the model changed, and errors propagate so a failed build is visible.
+    """
+    model = embedding.model_name()
+    metadata = {"hnsw:space": "cosine", "model": model}
+    if create:
+        client = _client()
+        collection = client.get_or_create_collection(COLLECTION, metadata=metadata)
+        if (collection.metadata or {}).get("model") != model:
+            client.delete_collection(COLLECTION)
+            collection = client.create_collection(COLLECTION, metadata=metadata)
+        return collection
+    try:
+        return _client().get_collection(COLLECTION)
+    except Exception:
+        return None
+
+
+def _usable(collection: Any | None) -> bool:
+    return (
+        collection is not None
+        and (collection.metadata or {}).get("model") == embedding.model_name()
+        and collection.count() > 0
+    )
+
+
+def _stored(collection: Any) -> dict[str, str]:
+    """record id -> text hash for everything already in the collection, read in pages."""
+    found: dict[str, str] = {}
+    total = collection.count()
+    for offset in range(0, total, WRITE_BATCH):
+        rows = collection.get(include=["metadatas"], limit=WRITE_BATCH, offset=offset)
+        found.update({record_id: meta["hash"] for record_id, meta in zip(rows["ids"], rows["metadatas"])})
+    return found
+
+
+def _upsert(collection: Any, rows: list[tuple[str, str, str]], vectors: np.ndarray) -> None:
+    for start in range(0, len(rows), WRITE_BATCH):
+        part = rows[start : start + WRITE_BATCH]
+        collection.upsert(
+            ids=[_record_id(law, article) for law, article, _ in part],
+            embeddings=vectors[start : start + WRITE_BATCH].tolist(),
+            metadatas=[{"law_name": law, "article_number": article, "hash": digest} for law, article, digest in part],
+        )
 
 
 def status() -> dict[str, Any]:
-    index = get_index()
-    meta: dict[str, Any] = {}
-    try:
-        meta = json.loads(META_PATH.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        pass
+    collection = _open()
+    meta = (collection.metadata or {}) if collection is not None else {}
     return {
         "embedding_configured": embedding.enabled(),
         "model": embedding.model_name(),
-        "index_ready": index is not None,
-        "articles": len(index.rows) if index else 0,
+        "index_ready": _usable(collection),
+        "articles": collection.count() if collection is not None else 0,
         "built_at": meta.get("built_at"),
         "index_model": meta.get("model"),
+        "store": "chromadb",
     }
-
-
-def _save(rows: list[tuple[str, str, str]], matrix: np.ndarray, model: str, cats: tuple[str, ...]) -> None:
-    RAG_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    tmp_matrix, tmp_meta = INDEX_PATH.with_suffix(".tmp"), META_PATH.with_suffix(".tmp")
-    with tmp_matrix.open("wb") as handle:
-        np.save(handle, matrix.astype(np.float16))
-    tmp_meta.write_text(
-        json.dumps(
-            {"model": model, "dim": int(matrix.shape[1]) if matrix.size else 0, "categories": list(cats),
-             "built_at": time.strftime("%Y-%m-%dT%H:%M:%S"), "rows": [list(row) for row in rows]},
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
-    )
-    tmp_matrix.replace(INDEX_PATH)
-    tmp_meta.replace(META_PATH)
 
 
 class BuildError(RuntimeError):
@@ -170,9 +163,32 @@ def plan_build(articles: list[dict[str, Any]]) -> tuple[list[tuple[str, str, str
         seen.add(key)
         text = embedding_text(item)
         targets.append((*key, _text_hash(text), text))
-    raw = _read_raw()
-    have = {row[2] for row in raw[1]} if raw and raw[2].get("model") == embedding.model_name() else set()
+    collection = _open()
+    have = set(_stored(collection).values()) if _usable(collection) else set()
     return targets, len({t[2] for t in targets if t[2] not in have})
+
+
+def _import_legacy(collection: Any, targets: list[tuple[str, str, str, str]], stored: dict[str, str]) -> int:
+    """Move vectors from the pre-ChromaDB numpy index when they still match the current text hashes."""
+    if not (LEGACY_INDEX_PATH.exists() and LEGACY_META_PATH.exists()):
+        return 0
+    try:
+        meta = json.loads(LEGACY_META_PATH.read_text(encoding="utf-8"))
+        matrix = np.load(LEGACY_INDEX_PATH).astype(np.float32)
+    except (OSError, ValueError):
+        return 0
+    if meta.get("model") != embedding.model_name() or matrix.shape[0] != len(meta["rows"]):
+        return 0
+    wanted = {(law, article, digest) for law, article, digest, _ in targets}
+    keep = [
+        (index, (law, article, digest))
+        for index, (law, article, digest) in enumerate(meta["rows"])
+        if (law, article, digest) in wanted and stored.get(_record_id(law, article)) != digest
+    ]
+    if keep:
+        rows = [row for _, row in keep]
+        _upsert(collection, rows, _normalize_rows(matrix[[index for index, _ in keep]]))
+    return len(keep)
 
 
 def build_index(
@@ -180,45 +196,48 @@ def build_index(
     *,
     embedder: Callable[[list[str]], list[list[float]] | None] = embedding.embed,
     batch_size: int = 32,
-    save_every: int = 25,
     progress: Callable[[str], None] = lambda message: None,
 ) -> dict[str, Any]:
-    """Embed articles whose text hash is not already indexed; safe to re-run after an interruption."""
-    model, cats = embedding.model_name(), categories()
+    """Embed articles whose text hash is not stored yet; each batch is written before the next starts."""
+    model = embedding.model_name()
     targets, _ = plan_build(articles)
-    raw = _read_raw()
-    vectors: dict[str, np.ndarray] = {}
-    if raw and raw[2].get("model") == model:
-        for (_, _, digest), vector in zip(raw[1], raw[0]):
-            vectors[digest] = vector.astype(np.float32)
-    reused = len(vectors)
+    collection = _open(create=True)
+    stored = _stored(collection)
+    wanted = {_record_id(law, article) for law, article, _, _ in targets}
+    gone = [record_id for record_id in stored if record_id not in wanted]
+    for start in range(0, len(gone), WRITE_BATCH):
+        collection.delete(ids=gone[start : start + WRITE_BATCH])
 
-    pending: dict[str, str] = {}
-    for _, _, digest, text in targets:
-        if digest not in vectors:
-            pending.setdefault(digest, text)
-    todo = list(pending.items())
-
-    def snapshot() -> None:
-        kept = [(law, article, digest) for law, article, digest, _ in targets if digest in vectors]
-        if kept:
-            _save(kept, _normalize_rows(np.stack([vectors[d] for _, _, d in kept])), model, cats)
+    imported = _import_legacy(collection, targets, stored)
+    if imported:
+        stored = _stored(collection)
+    have = set(stored.values())
+    reused = len({digest for _, _, digest, _ in targets if digest in have})
+    pending = [
+        (law, article, digest, text)
+        for law, article, digest, text in targets
+        if stored.get(_record_id(law, article)) != digest
+    ]
 
     embedded = 0
-    for start in range(0, len(todo), batch_size):
-        chunk = todo[start : start + batch_size]
-        result = embedder([text for _, text in chunk])
+    for start in range(0, len(pending), batch_size):
+        chunk = pending[start : start + batch_size]
+        result = embedder([text for *_, text in chunk])
         if result is None or len(result) != len(chunk):
-            snapshot()
             raise BuildError(f"embedding request failed after {embedded} new vectors; re-run to resume")
-        for (digest, _), vector in zip(chunk, result):
-            vectors[digest] = np.asarray(vector, dtype=np.float32)
+        vectors = _normalize_rows(np.asarray(result, dtype=np.float32))
+        _upsert(collection, [row[:3] for row in chunk], vectors)
         embedded += len(chunk)
-        progress(f"embedded {embedded}/{len(todo)}")
-        if (start // batch_size + 1) % save_every == 0:
-            snapshot()
-    snapshot()
-    return {"articles": len([t for t in targets if t[2] in vectors]), "embedded": embedded, "reused": reused, "model": model}
+        progress(f"embedded {embedded}/{len(pending)}")
+
+    collection.modify(metadata={"model": model, "built_at": time.strftime("%Y-%m-%dT%H:%M:%S")})
+    return {
+        "articles": collection.count(),
+        "embedded": embedded,
+        "imported": imported,
+        "reused": reused,
+        "model": model,
+    }
 
 
 @dataclass
@@ -252,17 +271,25 @@ def embed_query_texts(texts: list[str]) -> np.ndarray | None:
 
 
 def search(module: Any, texts: list[str], k: int = 20) -> VectorResult | None:
-    """Nearest articles per query text, hydrated to full articles; None when vectors are unavailable."""
-    index = get_index()
+    """Nearest articles per query text (cosine, ChromaDB HNSW), hydrated to full articles; None when unavailable."""
     texts = [t for t in dict.fromkeys(t.strip() for t in texts) if t]
-    if index is None or not texts or not embedding.enabled():
+    if not texts or not embedding.enabled():
+        return None
+    collection = _open()
+    if not _usable(collection):
         return None
     queries = _embed_queries(texts)
     if queries is None:
         return None
     floor = min_cosine()
-    per_query = [[(i, s) for i, s in hits if s >= floor] for hits in index.top(queries, k)]
-    wanted = list(dict.fromkeys((index.rows[i][0], index.rows[i][1]) for hits in per_query for i, _ in hits))
+    found = collection.query(
+        query_embeddings=queries.tolist(), n_results=min(k, collection.count()), include=["metadatas", "distances"]
+    )
+    per_query = [
+        [(meta["law_name"], meta["article_number"], 1.0 - dist) for meta, dist in zip(metas, dists) if 1.0 - dist >= floor]
+        for metas, dists in zip(found["metadatas"], found["distances"])
+    ]
+    wanted = list(dict.fromkeys((law, article) for hits in per_query for law, article, _ in hits))
     if not wanted:
         return VectorResult([[] for _ in texts], queries)
     try:
@@ -271,16 +298,23 @@ def search(module: Any, texts: list[str], k: int = 20) -> VectorResult | None:
         return None
     by_key = {(row["law_name"], row["article_number"]): row for row in data}
     lists = [
-        [
-            {**by_key[index.rows[i][:2]], "vec": score}
-            for i, score in hits
-            if index.rows[i][:2] in by_key
-        ]
+        [{**by_key[(law, article)], "vec": score} for law, article, score in hits if (law, article) in by_key]
         for hits in per_query
     ]
     return VectorResult(lists, queries)
 
 
 def score_candidates(result: VectorResult, keys: Iterable[tuple[str, str]]) -> dict[tuple[str, str], float]:
-    index = get_index()
-    return index.similarity(result.queries, keys) if index is not None else {}
+    """Best cosine between each article and any of the query vectors, for articles found by other routes."""
+    collection = _open()
+    keys = list(dict.fromkeys(keys))
+    if not _usable(collection) or not keys:
+        return {}
+    ids = [_record_id(law, article) for law, article in keys]
+    rows = collection.get(ids=ids, include=["embeddings"])
+    stored = {record_id: vector for record_id, vector in zip(rows["ids"], rows["embeddings"])}
+    scores: dict[tuple[str, str], float] = {}
+    for key, record_id in zip(keys, ids):
+        if record_id in stored:
+            scores[key] = float(np.max(result.queries @ np.asarray(stored[record_id], dtype=np.float32)))
+    return scores

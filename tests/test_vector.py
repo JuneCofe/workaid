@@ -1,11 +1,10 @@
 import json
 
-import numpy as np
 import pytest
 
 from backend.retrieval import embedding, vector
 from backend.retrieval import pipeline as pipeline_module
-from backend.retrieval.vector import BuildError, VectorIndex
+from backend.retrieval.vector import BuildError
 
 
 def _article(law, number, content, category="法律"):
@@ -37,10 +36,10 @@ def fake_embedder(texts):
 
 @pytest.fixture()
 def index_dir(tmp_path, monkeypatch):
-    monkeypatch.setattr(vector, "INDEX_PATH", tmp_path / "vectors.npy")
-    monkeypatch.setattr(vector, "META_PATH", tmp_path / "vectors_meta.json")
-    monkeypatch.setattr(vector, "RAG_CACHE_DIR", tmp_path)
-    vector._STATE.update(mtime=None, index=None)
+    monkeypatch.setattr(vector, "CHROMA_DIR", tmp_path / "chroma")
+    monkeypatch.setattr(vector, "LEGACY_INDEX_PATH", tmp_path / "vectors.npy")
+    monkeypatch.setattr(vector, "LEGACY_META_PATH", tmp_path / "vectors_meta.json")
+    vector._CLIENTS.clear()
     vector._QUERY_CACHE.clear()
     return tmp_path
 
@@ -69,7 +68,7 @@ def test_build_index_is_incremental_and_resumable(index_dir):
     calls.clear()
     second = vector.build_index([A1, A2, A3], embedder=counting, batch_size=10)
     assert second["reused"] == 2 and second["embedded"] == 1 and calls == [1]
-    assert vector.get_index().matrix.shape == (3, 3)
+    assert vector._open().count() == 3
 
     _, to_embed = vector.plan_build([A1, A2, A3])
     assert to_embed == 0
@@ -85,18 +84,37 @@ def test_failed_batch_keeps_progress_and_raises(index_dir):
     with pytest.raises(BuildError):
         vector.build_index([A1, A2, A3], embedder=flaky, batch_size=1)
 
-    assert len(vector.get_index().rows) == 1
+    assert vector._open().count() == 1
 
 
 def test_index_from_another_model_is_ignored(index_dir, monkeypatch):
     vector.build_index([A1], embedder=fake_embedder)
-    assert vector.get_index() is not None
+    assert vector.status()["index_ready"] is True
 
     monkeypatch.setenv("EMBEDDING_MODEL", "some/other-model")
-    vector._STATE.update(mtime=None, index=None)
 
-    assert vector.get_index() is None
     assert vector.status()["index_ready"] is False
+    assert vector.search(object(), ["x"]) is None
+
+
+def test_index_is_imported_from_the_legacy_numpy_store(index_dir, monkeypatch):
+    import numpy as np
+
+    rows = [[A1["law_name"], A1["article_number"], vector._text_hash(vector.embedding_text(A1))]]
+    np.save(index_dir / "vectors.npy", np.array([[1.0, 0.0, 0.0]], dtype=np.float16))
+    (index_dir / "vectors_meta.json").write_text(
+        json.dumps({"model": embedding.model_name(), "rows": rows}, ensure_ascii=False), encoding="utf-8"
+    )
+    calls = []
+
+    def must_not_embed(texts):
+        calls.append(texts)
+        return fake_embedder(texts)
+
+    result = vector.build_index([A1], embedder=must_not_embed)
+
+    assert result["imported"] == 1 and result["embedded"] == 0 and calls == []
+    assert vector.status()["index_ready"] is True
 
 
 def test_search_hydrates_hits_and_applies_the_cosine_floor(index_dir, monkeypatch):
@@ -206,10 +224,3 @@ def test_pipeline_survives_a_slow_or_failing_embedding_service(index_dir, monkey
     assert [i["article_number"] for i in items] == ["第三十条"]
 
 
-def test_top_and_similarity_on_a_toy_index():
-    matrix = np.array([[1, 0], [0, 1], [0.7071, 0.7071]], dtype=np.float32)
-    index = VectorIndex(matrix, [("a", "1", "h1"), ("b", "2", "h2"), ("c", "3", "h3")], "m")
-    q = np.array([[1, 0]], dtype=np.float32)
-
-    assert [i for i, _ in index.top(q, 2)[0]] == [0, 2]
-    assert index.similarity(q, [("b", "2")])[("b", "2")] == pytest.approx(0.0)

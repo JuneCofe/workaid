@@ -17,14 +17,13 @@ from .quality import classify
 from .query import QueryPlan, clean
 from .recall import Candidate
 
-POOL_SIZE = 120
-API_POOL_SIZE = 40
+POOL_SIZE = 30
 MAX_PER_LAW = 3
 DEFAULT_MIN_SCORE = 0.28
 OPEN_MIN_SCORE = 0.6
 OPEN_VEC_MIN_SCORE = 0.55
-API_MIN_SCORE = 0.2
-API_BLEND = 0.15
+# Cross-encoder relevance is a probability-like score; unrelated articles fall well below this.
+RERANK_MIN_SCORE = 0.1
 TRUNCATED_PENALTY = 0.1
 # Cosine range mapped onto 0..1; bge-m3 puts related Chinese legal text around 0.5-0.75.
 VEC_FLOOR = 0.30
@@ -38,8 +37,8 @@ _WEIGHTS_LLM_TERMS_ONLY = {"terms": 0.35, "rrf": 0.15, "bm25": 0.15, "prior": 0.
 # literal overlap with the sentence has to carry the decision.
 _WEIGHTS_OPEN = {"rrf": 0.15, "bm25": 0.15, "prior": 0.10, "bigram": 0.60}
 
-_API_CACHE: OrderedDict[str, dict[int, float]] = OrderedDict()
-_API_CACHE_SIZE = 256
+_DOC_CACHE: OrderedDict[tuple[str, str], float] = OrderedDict()
+_DOC_CACHE_SIZE = 4096
 _API_DOWN_UNTIL = [0.0]
 
 
@@ -65,6 +64,15 @@ def _law_match(law_name: str, plan: QueryPlan) -> float:
             if law in law_name:
                 best = max(best, 1.0 if index < 2 else 0.7)
     return best
+
+
+def _doc_penalty(item: dict[str, Any]) -> float:
+    """Press releases and notices about cases are not statutes, whatever their wording."""
+    if PSEUDO_STATUTE.search(item["law_name"]):
+        return 0.30
+    if NOTICE_STATUTE.search(item["law_name"]):
+        return 0.12
+    return 0.0
 
 
 @dataclass
@@ -141,10 +149,7 @@ def heuristic_scores(
             features["concept"] = sum(per_concept) / len(per_concept)
             features["law"] = _law_match(item["law_name"], plan)
         score = sum(weights[name] * features[name] for name in weights) / sum(weights.values())
-        if PSEUDO_STATUTE.search(item["law_name"]):
-            score -= 0.30
-        elif NOTICE_STATUTE.search(item["law_name"]):
-            score -= 0.12
+        score -= _doc_penalty(item)
         scores.append(max(0.0, min(1.0, score)))
     return scores
 
@@ -158,25 +163,33 @@ def _rerank_endpoint() -> str:
     return ""
 
 
+def configured() -> bool:
+    return bool(_rerank_endpoint() and os.getenv("RERANK_MODEL", "").strip())
+
+
 def api_enabled() -> bool:
-    return bool(_rerank_endpoint() and os.getenv("RERANK_MODEL", "").strip()) and time.monotonic() >= _API_DOWN_UNTIL[0]
+    return configured() and time.monotonic() >= _API_DOWN_UNTIL[0]
 
 
-def _api_scores(query: str, candidates: list[Candidate]) -> dict[int, float] | None:
-    """Cross-encoder relevance from a Cohere/Jina/SiliconFlow-style /rerank endpoint.
+def _doc_key(candidate: Candidate) -> str:
+    item = candidate.item
+    return f"{item['law_name']}|{item['article_number']}|{hashlib.sha1(item['content'].encode('utf-8')).hexdigest()[:12]}"
 
-    A failure opens a circuit for RERANK_COOLDOWN seconds so an unreachable service costs one timeout,
-    not one per question.
-    """
-    digest = hashlib.sha1(
-        (query + "\0" + "\0".join(f"{c.key[0]}{c.key[1]}" for c in candidates)).encode("utf-8")
-    ).hexdigest()
-    if digest in _API_CACHE:
-        _API_CACHE.move_to_end(digest)
-        return _API_CACHE[digest]
-    documents = [
-        f"{c.item['law_name']} {c.item['article_number']} {c.item['content'][:600]}" for c in candidates
-    ]
+
+def _document(candidate: Candidate) -> str:
+    item = candidate.item
+    return f"{item['law_name']} {item['article_number']} {item['content'][:600]}"
+
+
+def _remember(key: tuple[str, str], score: float) -> None:
+    _DOC_CACHE[key] = score
+    _DOC_CACHE.move_to_end(key)
+    if len(_DOC_CACHE) > _DOC_CACHE_SIZE:
+        _DOC_CACHE.popitem(last=False)
+
+
+def _request(query: str, candidates: list[Candidate]) -> list[float] | None:
+    """One /rerank call for the given candidates; None on any failure, which opens the circuit."""
     headers = {"Content-Type": "application/json"}
     if os.getenv("RERANK_API_KEY"):
         headers["Authorization"] = f"Bearer {os.environ['RERANK_API_KEY']}"
@@ -184,7 +197,7 @@ def _api_scores(query: str, candidates: list[Candidate]) -> dict[int, float] | N
         response = httpx.post(
             _rerank_endpoint(),
             json={"model": os.getenv("RERANK_MODEL", "").strip(), "query": query,
-                  "documents": documents, "top_n": len(documents)},
+                  "documents": [_document(c) for c in candidates], "top_n": len(candidates)},
             headers=headers,
             timeout=float(os.getenv("RERANK_TIMEOUT", "3")),
             follow_redirects=False,
@@ -204,47 +217,64 @@ def _api_scores(query: str, candidates: list[Candidate]) -> dict[int, float] | N
         return None
     if any(score < 0 or score > 1 for score in raw.values()):
         raw = {index: 1 / (1 + math.exp(-score)) for index, score in raw.items()}
-    _API_CACHE[digest] = raw
-    if len(_API_CACHE) > _API_CACHE_SIZE:
-        _API_CACHE.popitem(last=False)
-    return raw
+    return [raw.get(index, 0.0) for index in range(len(candidates))]
+
+
+def _api_scores(query: str, candidates: list[Candidate]) -> list[float] | None:
+    """Cross-encoder relevance for every candidate, one score per candidate in order.
+
+    Scores are cached per (query, article), so a repeated question or a re-ranked pool only pays for the
+    documents it has not seen. A failed call opens a circuit for RERANK_COOLDOWN seconds, so an unreachable
+    service costs one timeout rather than one per question.
+    """
+    keys = [(query, _doc_key(c)) for c in candidates]
+    missing = [i for i, key in enumerate(keys) if key not in _DOC_CACHE]
+    if missing:
+        if not api_enabled():
+            return None
+        fresh = _request(query, [candidates[i] for i in missing])
+        if fresh is None:
+            return None
+        for i, score in zip(missing, fresh):
+            _remember(keys[i], score)
+    return [_DOC_CACHE[key] for key in keys]
 
 
 def rerank(
-    plan: QueryPlan, candidates: list[Candidate], top_k: int, module: Any = None
+    plan: QueryPlan, candidates: list[Candidate], top_k: int, module: Any = None, pool_size: int = POOL_SIZE
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Score the recalled pool, drop low-relevance hits, and keep the top_k with a per-law cap."""
-    pool = candidates[:POOL_SIZE]
+    """Order the fused pool by the cross-encoder and keep the top_k with a per-law cap.
+
+    The cross-encoder decides the order and must clear its own threshold, but it cannot tell whether
+    anything relevant exists, so the heuristic gate still has to pass. Without a reachable reranker the
+    fused pool is ordered by the heuristic score and only the heuristic gate applies.
+    """
+    pool = candidates[:pool_size]
     base = heuristic_scores(plan, pool, make_idf(module) if module is not None else None)
-    scores = list(base)
-    reranker = "heuristic"
     if plan.concepts or plan.llm_terms:
-        min_score = float(os.getenv("RETRIEVAL_MIN_SCORE", DEFAULT_MIN_SCORE))
+        heuristic_gate = float(os.getenv("RETRIEVAL_MIN_SCORE", DEFAULT_MIN_SCORE))
     elif any(c.vec > 0 for c in pool):
         # Literal overlap cannot carry a paraphrase, so a strong cosine must be able to clear the gate.
-        min_score = float(os.getenv("RETRIEVAL_MIN_SCORE_OPEN_VEC", OPEN_VEC_MIN_SCORE))
+        heuristic_gate = float(os.getenv("RETRIEVAL_MIN_SCORE_OPEN_VEC", OPEN_VEC_MIN_SCORE))
     else:
-        min_score = float(os.getenv("RETRIEVAL_MIN_SCORE_OPEN", OPEN_MIN_SCORE))
-    if pool and api_enabled():
-        # Cross-encoder calls are priced per document, so only the heuristic front-runners are sent.
-        front = sorted(range(len(pool)), key=lambda i: -base[i])[:API_POOL_SIZE]
-        api = _api_scores(plan.original, [pool[i] for i in front])
-        if api is None:
-            reranker = "heuristic(api_failed)"
-        else:
-            reranker = "api+heuristic"
-            blend = min(1.0, max(0.0, float(os.getenv("RERANK_BLEND", API_BLEND))))
-            by_pool = {front[position]: value for position, value in api.items() if position < len(front)}
-            scores = [
-                blend * by_pool[i] + (1 - blend) * s if i in by_pool else s * (1 - blend)
-                for i, s in enumerate(scores)
-            ]
+        heuristic_gate = float(os.getenv("RETRIEVAL_MIN_SCORE_OPEN", OPEN_MIN_SCORE))
 
-    # The relevance gate always uses the heuristic score: a cross-encoder ranks what is there but
-    # cannot tell whether anything relevant exists, and a lowered gate lets small talk through.
-    ranked = sorted(
-        (_Scored(c, s, b) for c, s, b in zip(pool, scores, base)), key=lambda x: -x.score
-    )
+    use_api = os.getenv("RERANK_MODE", "bge") == "bge"
+    api = _api_scores(plan.original, pool) if pool and use_api else None
+    if api is not None:
+        bge_share = min(1.0, max(0.0, float(os.getenv("RERANK_WEIGHT", "0.25"))))
+        scores = [
+            max(0.0, bge_share * score + (1 - bge_share) * b - _doc_penalty(c.item))
+            for score, b, c in zip(api, base, pool)
+        ]
+        reranker = "bge-reranker"
+        min_score = float(os.getenv("RERANK_MIN_SCORE", RERANK_MIN_SCORE))
+    else:
+        scores = list(base)
+        reranker = "heuristic(fallback)" if configured() else "heuristic"
+        min_score = heuristic_gate
+
+    ranked = sorted((_Scored(c, s, b) for c, s, b in zip(pool, scores, base)), key=lambda x: -x.score)
     selected: list[dict[str, Any]] = []
     per_law: dict[str, int] = {}
     dropped = 0
@@ -256,7 +286,7 @@ def rerank(
             damaged += 1
             continue
         penalty = TRUNCATED_PENALTY if defect else 0.0
-        if entry.base - penalty < min_score:
+        if entry.score - penalty < min_score or entry.base - penalty < heuristic_gate:
             dropped += 1
             continue
         score = entry.score - penalty

@@ -191,7 +191,7 @@ class _Response:
 def _enable_api(monkeypatch):
     monkeypatch.setenv("RERANK_API_URL", "https://rerank.example.com/v1/rerank")
     monkeypatch.setenv("RERANK_MODEL", "bge-reranker-v2-m3")
-    rerank_module._API_CACHE.clear()
+    rerank_module._DOC_CACHE.clear()
 
 
 def test_api_reranker_scores_are_blended_and_cached(monkeypatch):
@@ -213,7 +213,7 @@ def test_api_reranker_scores_are_blended_and_cached(monkeypatch):
     items, trace = search_local(engine, "公司拖欠我两个月工资", limit=2)
     search_local(engine, "公司拖欠我两个月工资", limit=2)
 
-    assert trace["reranker"] == "api+heuristic"
+    assert trace["reranker"] == "bge-reranker"
     assert items[0]["article_number"] == "第五十条"
     assert len(calls) == 1
 
@@ -230,7 +230,7 @@ def test_api_reranker_cannot_lower_the_relevance_gate(monkeypatch):
 
     items, trace = search_local(engine, "单位答应的事情一直没兑现", limit=5)
 
-    assert trace["reranker"] == "api+heuristic"
+    assert trace["reranker"] == "bge-reranker"
     assert items == [] and trace["below_threshold"] == 1
 
 
@@ -245,7 +245,7 @@ def test_api_reranker_failure_falls_back_to_heuristic(monkeypatch):
 
     items, trace = search_local(engine, "公司拖欠我两个月工资", limit=5)
 
-    assert trace["reranker"] == "heuristic(api_failed)"
+    assert trace["reranker"] == "heuristic(fallback)"
     assert [item["article_number"] for item in items] == ["第三十条"]
 
 
@@ -263,7 +263,7 @@ def test_unreachable_rerank_service_costs_one_timeout_not_one_per_question(monke
     _, first = search_local(engine, "公司拖欠我两个月工资", limit=5)
     _, second = search_local(engine, "公司拖欠工资怎么办", limit=5)
 
-    assert first["reranker"] == "heuristic(api_failed)" and second["reranker"] == "heuristic"
+    assert first["reranker"] == "heuristic(fallback)" and second["reranker"] == "heuristic(fallback)"
     assert len(calls) == 1
     rerank_module._API_DOWN_UNTIL[0] = 0.0
     search_local(engine, "公司拖欠工资怎么办啊", limit=5)
